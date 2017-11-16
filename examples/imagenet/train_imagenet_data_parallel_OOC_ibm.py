@@ -132,7 +132,7 @@ def main():
         log_interval = 1, 'epoch'
     else:
         val_interval = 100000, 'iteration'
-        log_interval = 10, 'iteration'
+        log_interval = 100, 'iteration'
         # val_interval = 1, 'epoch'
         # log_interval = 1000, 'iteration'
 
@@ -150,7 +150,7 @@ def main():
         'epoch', 'iteration', 'main/loss', 'validation/main/loss',
         'main/accuracy', 'validation/main/accuracy', 'lr'
     ]), trigger=log_interval)
-    trainer.extend(extensions.ProgressBar(update_interval=10))
+    trainer.extend(extensions.ProgressBar(update_interval=100))
     # trainer.extend(extensions.ProgressBar(update_interval=2))
 
     if args.resume:
