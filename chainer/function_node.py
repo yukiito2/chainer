@@ -12,9 +12,12 @@ from chainer import cuda
 from chainer import function_hook
 from chainer.utils import type_check
 from chainer import variable
+from chainer.cuda import memory_pool
 
 import time
 
+# for measurement computation time
+compute_events = list()
 
 class FunctionNode(object):
 
@@ -226,7 +229,17 @@ class FunctionNode(object):
         with cuda.get_device_from_array(*in_data):
             self._input_indexes_to_retain = None
             self._output_indexes_to_retain = None
+            
+            if memory_pool.get_profile_mode():
+                memory_pool.memory_log_add(("forward", str(self)))
+                start_event = cuda.Stream.null.record()
+                
             outputs = self.forward(in_data)
+            
+            if memory_pool.get_profile_mode():
+                end_event = cuda.Stream.null.record()
+                compute_events.append(("forward", str(self), start_event, end_event))
+                
             assert type(outputs) is tuple
 
         for hook in hooks:
@@ -288,10 +301,6 @@ class FunctionNode(object):
                         elapsed = time.time() - stime
                         print('# function.py:305, elapsed: {}'
                               .format(elapsed))
-
-                    if len(events) > 4:
-                        event = events.pop(0)
-                        event.synchronize()
 
         return ret
 
@@ -520,7 +529,15 @@ class FunctionNode(object):
         """
         # The default implementation uses backward(). You can override this
         # method without using backward().
+        if memory_pool.get_profile_mode():
+            memory_pool.memory_log_add(("backward", str(self)))
+            start_event = cuda.Stream.null.record()
+        
         gxs = self.backward(target_input_indexes, grad_outputs)
+        
+        if memory_pool.get_profile_mode():
+            end_event = cuda.Stream.null.record()
+            compute_events.append(("backward", str(self), start_event, end_event))
 
         len_gxs = len(gxs)
         if len_gxs == len(self.inputs):
