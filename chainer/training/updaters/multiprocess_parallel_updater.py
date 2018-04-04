@@ -32,12 +32,9 @@ import numpy
 
 from chainer import configuration
 
-<<<<<<< HEAD
-=======
 from statistics import mean
 execution_times = list()
 
->>>>>>> 555a336... Optimize swap-target and swapin-timing
 
 class _Worker(multiprocessing.Process):
 
