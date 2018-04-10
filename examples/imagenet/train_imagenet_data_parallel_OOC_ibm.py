@@ -132,7 +132,7 @@ def main():
         log_interval = 1, 'epoch'
     else:
         val_interval = 100000, 'iteration'
-        log_interval = 100, 'iteration'
+        log_interval = 10, 'iteration'
         # val_interval = 1, 'epoch'
         # log_interval = 1000, 'iteration'
 
@@ -150,8 +150,8 @@ def main():
         'epoch', 'iteration', 'main/loss', 'validation/main/loss',
         'main/accuracy', 'validation/main/accuracy', 'lr'
     ]), trigger=log_interval)
-    trainer.extend(extensions.ProgressBar(update_interval=100))
-    # trainer.extend(extensions.ProgressBar(update_interval=2))
+    # trainer.extend(extensions.ProgressBar(update_interval=100))
+    trainer.extend(extensions.ProgressBar(update_interval=2))
 
     if args.resume:
         chainer.serializers.load_npz(args.resume, trainer)
@@ -160,7 +160,7 @@ def main():
         # with chainer.out_of_core_mode(
         #        fine_granularity=True, devices=devices):
         with chainer.out_of_core_mode(
-                fine_granularity=True, async=False, devices=devices):
+                fine_granularity=True, async=True, devices=devices):
             trainer.run()
     else:
         trainer.run()
