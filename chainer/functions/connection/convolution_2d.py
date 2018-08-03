@@ -27,7 +27,7 @@ def _pair(x):
 
 class Convolution2DFunction(function_node.FunctionNode):
 
-    def __init__(self, stride=1, pad=0, cover_all=False, **kwargs):
+    def __init__(self, stride=1, pad=0, cover_all=False, groups=1, **kwargs):
         argument.check_unexpected_kwargs(
             kwargs,
             deterministic="deterministic argument is not supported anymore. "
@@ -43,6 +43,7 @@ class Convolution2DFunction(function_node.FunctionNode):
         self.sy, self.sx = _pair(stride)
         self.ph, self.pw = _pair(pad)
         self.cover_all = cover_all
+        self.groups = groups
 
     def check_type_forward(self, in_types):
         n_in = in_types.size()
@@ -130,7 +131,7 @@ class Convolution2DFunction(function_node.FunctionNode):
 
             filter_desc = cudnn.create_filter_descriptor(W)
             conv_desc = cudnn.create_convolution_descriptor(
-                (self.ph, self.pw), (self.sy, self.sx), x.dtype)
+                (self.ph, self.pw), (self.sy, self.sx), x.dtype, groups=self.groups)
             if b is not None:
                 bias_desc = cudnn.create_tensor_descriptor(
                     b[None, :, None, None])
@@ -178,7 +179,7 @@ class Convolution2DFunction(function_node.FunctionNode):
             xh, xw = x.shape[2:]
             gx = chainer.functions.deconvolution_2d(
                 gy, W, stride=(self.sy, self.sx), pad=(self.ph, self.pw),
-                outsize=(xh, xw))
+                outsize=(xh, xw), groups=self.groups)
             ret.append(gx)
         if 1 in indexes:
             gW, = Convolution2DGradW(self).apply((x, gy))
@@ -199,6 +200,7 @@ class Convolution2DGradW(function_node.FunctionNode):
         self.sx = conv2d.sx
         self.ph = conv2d.ph
         self.pw = conv2d.pw
+        self.groups = conv2d.groups
         self.cover_all = conv2d.cover_all
         self.W_dtype = W_node.dtype
 
@@ -238,7 +240,7 @@ class Convolution2DGradW(function_node.FunctionNode):
 
         filter_desc = cudnn.create_filter_descriptor(gW)
         conv_desc = cudnn.create_convolution_descriptor(
-            (self.ph, self.pw), (self.sy, self.sx), x.dtype)
+            (self.ph, self.pw), (self.sy, self.sx), x.dtype, groups=self.groups)
 
         oz_dtype = 'd' if x.dtype == 'd' else 'f'
         one = numpy.array(1, dtype=oz_dtype).ctypes
@@ -281,7 +283,7 @@ class Convolution2DGradW(function_node.FunctionNode):
         return ret
 
 
-def convolution_2d(x, W, b=None, stride=1, pad=0, cover_all=False, **kwargs):
+def convolution_2d(x, W, b=None, stride=1, pad=0, cover_all=False, groups=1, **kwargs):
     """convolution_2d(x, W, b=None, stride=1, pad=0, cover_all=False)
 
     Two-dimensional convolution function.
@@ -405,7 +407,7 @@ cover_all=True)
         "context where value is either `True` or `False`.")
     argument.assert_kwargs_empty(kwargs)
 
-    fnode = Convolution2DFunction(stride, pad, cover_all)
+    fnode = Convolution2DFunction(stride, pad, cover_all, groups=groups)
     if b is None:
         args = x, W
     else:

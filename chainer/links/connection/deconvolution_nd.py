@@ -44,7 +44,7 @@ class DeconvolutionND(link.Link):
 
     """
 
-    def __init__(self, ndim, in_channels, out_channels, ksize, stride=1, pad=0,
+    def __init__(self, ndim, in_channels, out_channels, ksize, stride=1, pad=0, groups=1,
                  nobias=False, outsize=None,
                  initialW=None, initial_bias=None):
         super(DeconvolutionND, self).__init__()
@@ -53,6 +53,7 @@ class DeconvolutionND(link.Link):
         self.stride = stride
         self.pad = pad
         self.outsize = outsize
+        self.groups = groups
 
         with self.init_scope():
             W_initializer = initializers._get_initializer(initialW)
@@ -69,4 +70,4 @@ class DeconvolutionND(link.Link):
     def __call__(self, x):
         return deconvolution_nd.deconvolution_nd(
             x, self.W, b=self.b, stride=self.stride, pad=self.pad,
-            outsize=self.outsize)
+            outsize=self.outsize, groups=self.groups)

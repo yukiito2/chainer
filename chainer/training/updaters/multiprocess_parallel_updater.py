@@ -9,7 +9,6 @@ from chainer import cuda
 from chainer.dataset import convert
 from chainer import reporter
 from chainer.training import updater
-from chainer.cuda import memory_pool
 
 if sys.version_info < (3, 0, 0):
     import pynvml as pynvml
@@ -28,8 +27,9 @@ import numpy
 from chainer import configuration
 
 from statistics import mean
-execution_times = list()
 
+
+execution_times = list()
 
 class _Worker(multiprocessing.Process):
 
@@ -267,23 +267,25 @@ class MultiprocessParallelUpdater(updater.StandardUpdater):
             batch = self.get_iterator('main').next()
             batch = self.converter(batch, self._devices[0])
 
-            #execution_time = time.time()
-            
+            execution_time = time.time()
+        
             loss = _calc_loss(self._master, batch)
-            
-            if memory_pool.get_profile_mode():
-                memory_pool.memory_log_add(("forward_to_backward", ))
-            
+
+            f_time = (time.time() - execution_time) * 1000
+
             self._master.cleargrads()
             loss.backward()
-            
-            #cuda.Stream.null.synchronize()
-            #execution_time = (time.time() - execution_time) * 1000
-            #execution_times.append(execution_time)
-            #if len(execution_times) > 10:
-            #    execution_times.pop(0)
-            #print("execution_time: ",  execution_time, sum(execution_times)/len(execution_times))
 
+            cuda.Stream.null.synchronize()
+            execution_time = (time.time() - execution_time) * 1000
+            execution_times.append(execution_time)
+            if len(execution_times) > 10:
+                execution_times.pop(0)
+            #print("execution_time: ",  execution_time, sum(execution_times)/len(execution_times))
+            #print("execution_time: ",  execution_time, f_time, execution_time-f_time)
+            print("execution_time: ", execution_time)
+
+            
             # NCCL: reduce grads
             null_stream = cuda.Stream.null
             if self.comm is not None:

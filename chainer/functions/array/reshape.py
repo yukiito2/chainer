@@ -16,6 +16,7 @@ class Reshape(function_node.FunctionNode):
 
     def __init__(self, shape):
         self.shape = shape
+        self.input_shape = None
         self._cnt = _count_unknown_dims(shape)
         assert self._cnt <= 1
 
@@ -41,11 +42,12 @@ class Reshape(function_node.FunctionNode):
 
     def forward(self, inputs):
         x, = inputs
+        self.input_shape = x.shape
         return x.reshape(self.shape),
 
     def backward(self, indexes, grad_outputs):
         gx, = grad_outputs
-        return reshape(gx, self.inputs[0].shape),
+        return reshape(gx, self.input_shape),
 
 
 def reshape(x, shape):

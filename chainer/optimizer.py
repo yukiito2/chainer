@@ -1,6 +1,7 @@
 import collections
 import copy
 import warnings
+import time
 
 import numpy
 import six

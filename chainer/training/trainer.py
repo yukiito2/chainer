@@ -18,7 +18,7 @@ from chainer.utils import argument
 from chainer import cuda
 from chainer import variable, function_node
 from chainer.cuda import memory_pool
-
+from chainer import configuration
 # Select the best-resolution timer function
 try:
     _get_time = time.perf_counter
@@ -27,7 +27,6 @@ except AttributeError:
         _get_time = time.clock
     else:
         _get_time = time.time
-
 
 class _ExtensionEntry(object):
 
@@ -154,7 +153,7 @@ class Trainer(object):
         self._snapshot_elapsed_time = 0.0
         self._final_elapsed_time = None
         
-        self.is_swap_targets = list()
+        self.is_targets = list()
         self.swapin_counts = list()
 
         updater.connect_trainer(self)
@@ -262,63 +261,64 @@ class Trainer(object):
         else:
             raise ValueError('extension %s not found' % name)
     
-    def make_log_list(self, tmp_list):
-        
-        exsit_swapin_item = False
+    def make_log_list(self):
+
+        tmp_list, swap_events = memory_pool.memory_log_get()
+
+        exsit_swapin_items = list()
         exsit_swapout_items = collections.defaultdict(lambda: None)
         
-        swapout_vars = list()
-        swapout_var_sizes = {}
+        target_vars = list()
         
         # collect compute time information
         compute_times = {}
         while len(function_node.compute_events) > 0:
             item = function_node.compute_events.pop()
+            item[2].synchronize()
             item[3].synchronize()
             compute_times[(item[0], item[1])] = cuda.cupy.cuda.get_elapsed_time(item[2], item[3])
         
         # collect swap time information
-        swap_times = {}
-        while len(variable.swap_events) > 0:
-            item = variable.swap_events.pop()
-            item[3].synchronize()
-            swap_times[(item[0], item[1])] = cuda.cupy.cuda.get_elapsed_time(item[2], item[3])
+        swap_times = list()
+        while len(swap_events) > 0:
+            item = swap_events.pop(0)
+            item[0].synchronize()
+            item[1].synchronize()
+            swap_times.append(cuda.cupy.cuda.get_elapsed_time(item[0], item[1]))
         
         # make log_list
         log_list = list()
         new_item = tmp_list.pop(0)
+
+        memory_event_count = 0
+        memory_events = {}
         
         while len(tmp_list) > 0:
             current_item = tmp_list.pop(0)
 
             if current_item[0] == "malloc":
-                if exsit_swapin_item:
-                    exsit_swapin_item = False
-                elif new_item[0] == "malloc":
-                    new_item = ("malloc", new_item[1]+current_item[1])
+                if len(exsit_swapin_items) > 0:
+                    exsit_swapin_item = exsit_swapin_items.pop(0)
+                    new_item = ("swapin", exsit_swapin_item[1], exsit_swapin_item[2], swap_times.pop(0), current_item[3])
                 else:
                     log_list.append(new_item)
-                    new_item = current_item
+                    new_item = ("malloc", current_item[1], current_item[3])
             elif current_item[0] == "free":
                 if exsit_swapout_items[current_item[2]] is not None:
                     log_list.append(new_item)
-                    new_item = ("swapout_free", current_item[1], exsit_swapout_items[current_item[2]])
+                    new_item = ("swapout_free", current_item[1], exsit_swapout_items[current_item[2]], current_item[3])
                     exsit_swapout_items[current_item[2]] = None
-                elif new_item[0] == "free":
-                    new_item = ("free", new_item[1]+current_item[1])
                 else:
                     log_list.append(new_item)
-                    new_item = ("free", current_item[1])
+                    new_item = ("free", current_item[1], current_item[3])
             elif current_item[0] == "swapin":
                 log_list.append(new_item)
-                new_item = ("swapin", current_item[1], current_item[2], swap_times[("swapin", current_item[2])])
-                exsit_swapin_item = True
+                exsit_swapin_items.append(current_item)
             elif current_item[0] == "swapout":
                 log_list.append(new_item)
-                new_item = ("swapout", current_item[1], current_item[2], swap_times[("swapout", current_item[2])])
+                new_item = ("swapout", current_item[1], current_item[2], swap_times.pop(0))
                 exsit_swapout_items[current_item[3]] = current_item[2]
-                swapout_vars.append(current_item[2])
-                swapout_var_sizes[current_item[2]] = current_item[1]
+                target_vars.append(current_item[2])
             elif current_item[0] == "forward" or current_item[0] == "backward":
                 if ("forward", current_item[1]) in compute_times.keys() and ("backward", current_item[1]) in compute_times.keys(): 
                     log_list.append(new_item)
@@ -328,78 +328,146 @@ class Trainer(object):
                 new_item = current_item
         log_list.append(new_item)
         
-        return log_list, swapout_vars, swapout_var_sizes
+        return log_list, target_vars
         
     def optimize_swap_targets(self):
         
         if memory_pool.get_profile_mode():
-            log_list, swapout_vars, swapout_var_sizes = self.make_log_list(memory_pool.memory_log_get())
-            total_mem_size = max(15*1024*1024*1024, memory_pool.total_bytes())
+            log_list, target_vars = self.make_log_list()
+            total_mem_size = memory_pool.total_bytes()
             
-            #print(log_list)
-            #print(swapout_vars)
+            compute_graph = function_node.compute_graph
+            var_sizes = function_node.var_sizes
+            func_backward_use_vars = function_node.func_backward_use_vars
+
+            #print("log_list = ", log_list)
+            #print("target_vars = ", target_vars)
+            #print("compute_graph = ", compute_graph)
+            #print("var_sizes = ", var_sizes)
+            #print("func_backward_use_vars = ", func_backward_use_vars)
             
             # filter memory_items
-            memory_items = list(filter(lambda item:item[0] in {"used_bytes", "malloc", "free", "swapin_timing", "swapout_free", "forward_to_backward"}, log_list))
+            forward_memory_items = list(filter(lambda item:item[0] in {"used_bytes", "malloc", "free", "swapout", "forward", "forward_to_backward"}, log_list))
+            backward_memory_items = list(filter(lambda item:item[0] in {"malloc", "free", "swapin_timing", "forward_to_backward"}, log_list))
+            while backward_memory_items[0][0] != "forward_to_backward":
+                backward_memory_items.pop(0)
 
-            # filter forward_times, swapout_items, backward_times and swapin_items
-            forward_times = list()
-            tmp_forward_time = 0.0
-            swapout_items = list()
-            backward_times = list()
-            tmp_backward_time = 0.0
-            swapin_items = list()
-            tmp_swapin_items = list()
-            num_swapin_timing = 0
+            # make forward_times (for recompute)
+            forward_times = {}
             for item in log_list:
                 if item[0] == "forward":
-                    tmp_forward_time += item[2]
-                elif item[0] == "swapout":
-                    forward_times.append(tmp_forward_time)
-                    tmp_forward_time = 0.0
-                    swapout_items.append(item)
-                elif item[0] == "backward":
-                    tmp_backward_time += item[2]
-                elif item[0] == "swapin":
-                    tmp_swapin_items.append(item)
-                elif item[0] == "swapin_timing":
-                    backward_times.append(tmp_backward_time)
-                    tmp_backward_time = 0.0
-                    swapin_items.append(tmp_swapin_items)
-                    tmp_swapin_items = list()
-                    num_swapin_timing += 1
-            backward_times.pop(0)
-            backward_times.append(tmp_backward_time)
-            swapin_items.pop(0)
-            swapin_items.append(tmp_swapin_items)
+                    forward_times[item[1]] = item[2]
+                
+            # make forward_times (for recompute)
+            forward_times = {}
+            for item in log_list:
+                if item[0] == "forward":
+                    forward_times[item[1]] = item[2]
+                
+            # make forward_workspace_sizes (for recompute)
+            forward_workspace_sizes = {}
+            current_layer = None
 
-            # make variables set
-            seen_vars = list()
-            for var in swapout_vars:
-                if var not in seen_vars:
-                    seen_vars.append(var)
-                    
-            def compact_swapin(targets, swapin_counts):
+            for item in log_list:
+                if item[0] == "malloc":
+                    if current_layer is not None:
+                        forward_workspace_sizes[current_layer] += item[1]
+                elif item[0] == "forward":
+                    current_layer = item[1]
+                    forward_workspace_sizes[current_layer] = 0    
+                elif item[0] == "forward_to_backward":
+                    break
+
+            # filter backward_items
+            backward_items = list(filter(lambda item:item[0] in {"backward", "swapin_timing"}, log_list))
             
+            # filter swapout_items, swapin_items
+            tmp_list = list(filter(lambda item:item[0] in {"swapout"}, log_list))
+            swapout_items = {}
+            for item in tmp_list:
+                swapout_items[item[2]] = (item[1], item[3])
+
+            tmp_list = list(filter(lambda item:item[0] in {"swapin"}, log_list))
+            swapin_items = {}
+            for item in tmp_list:
+                swapin_items[item[2]] = (item[1], item[3])
+
+            num_swapin_timing = len(list(filter(lambda item:item[0] in {"swapin_timing"}, backward_items)))
+
+            # make var_is_retained
+            var_is_retained = dict(zip(var_sizes.keys(), len(var_sizes.keys())*[False]))
+            for use_vars in func_backward_use_vars.values():
+                for var in use_vars:
+                    var_is_retained[var] = True
+
+
+            def sync_swapout(targets):            
+                compute_time = 0.0
+                swap_time = 0.0
+                swap_tasks = list()
+                swapout_sync_vars = list()
+
                 current_memory_usage = 0
+                max_memory_usage = 0
+
+                # simulate forward compute time and memory management
+                for memory_item in forward_memory_items:
+                    if memory_item[0] == "malloc":
+                        current_memory_usage += memory_item[1]
+                        # swapout_free when over memory capacity and synchronize
+                        while swap_tasks and (current_memory_usage > total_mem_size):
+                            var = swap_tasks[0][0]
+                            if compute_time < swap_tasks[0][1]:
+                                compute_time = swap_tasks[0][1]
+                            current_memory_usage -= var_sizes[var]
+                            swapout_sync_vars.append(var)
+                            swap_tasks.pop(0)
+                    elif memory_item[0] == "free":
+                        current_memory_usage -= memory_item[1]
+                    elif memory_item[0] == "swapout":
+                        var = memory_item[2]
+                        if targets[var] == "swap":
+                            swap_time = max(compute_time, swap_time) + swapout_items[var][1]
+                            swap_tasks.append((var, swap_time))
+                        elif targets[var] == "recompute":
+                            current_memory_usage -= var_sizes[var]
+                    elif memory_item[0] == "forward":
+                        # swapout_free when swapout has been finished
+                        while swap_tasks and (swap_tasks[0][1] < compute_time):
+                            var = swap_tasks[0][0]
+                            current_memory_usage -= var_sizes[var]
+                            swap_tasks.pop(0)
+                        compute_time += memory_item[2]
+                    elif memory_item[0] == "used_bytes":
+                        current_memory_usage = memory_item[1]
+                    elif memory_item[0] == "forward_to_backward":
+                        # swapout_free before backward
+                        while swap_tasks:
+                            var = swap_tasks[0][0]
+                            current_memory_usage -= var_sizes[var]
+                            swapout_sync_vars.append(var)
+                            swap_tasks.pop(0)
+                        break
+
+                    if current_memory_usage > max_memory_usage:
+                        max_memory_usage = current_memory_usage
+                    if max_memory_usage > total_mem_size:
+                        return float('inf'), float('inf'), None
+                    
+                return current_memory_usage, max(compute_time, swap_time), swapout_sync_vars
+
+
+            def compact_swapin(current_memory_usage, swapin_counts, swapin_sizes, recompute_sizes):
+            
                 max_memory_usage = 0
                 tmp_val = 0 # record max_memory_usage between swapin_timing
                 tmp_memory_usage = list()
 
-                # calculate swapin_sizes
-                swapin_sizes = num_swapin_timing*[0]
-                for i in range(num_swapin_timing):
-                    items = swapin_items[i]
-                    for item in items:
-                        if targets[item[2]]:
-                            swapin_sizes[i] += item[1]
-
-                swapin_timing_count = 0
-                swapin_times_count = 0
+                swapin_timing_count = -1
+                swapin_task_count = 0
 
                 # simulate memory management
-                for i in range(len(memory_items)):
-                    memory_item = memory_items[i]
+                for memory_item in backward_memory_items:
                     if memory_item[0] == "malloc":
                         current_memory_usage += memory_item[1]
                     elif memory_item[0] == "free":
@@ -407,15 +475,17 @@ class Trainer(object):
                     elif memory_item[0] == "swapin_timing":
                         tmp_memory_usage.append(tmp_val)
                         tmp_val = current_memory_usage
-                        for j in range(swapin_counts[swapin_timing_count]):
-                            current_memory_usage += swapin_sizes[swapin_times_count]
-                            swapin_times_count += 1
                         swapin_timing_count += 1
-                    elif memory_item[0] == "swapout_free":
-                        if targets[memory_item[2]]:
-                            current_memory_usage -= memory_item[1]
-                    elif memory_item[0] == "used_bytes":
-                        current_memory_usage = memory_item[1]
+                        for j in range(swapin_counts[swapin_timing_count]):
+                            current_memory_usage += swapin_sizes[swapin_task_count]
+                            swapin_task_count += 1
+
+                        for recompute_size in recompute_sizes[swapin_timing_count]:
+                            current_memory_usage += recompute_size
+                            if current_memory_usage > tmp_val:
+                                tmp_val = current_memory_usage
+                            if current_memory_usage > max_memory_usage:
+                                max_memory_usage = current_memory_usage
                     elif memory_item[0] == "forward_to_backward":
                         tmp_val = current_memory_usage
 
@@ -423,8 +493,8 @@ class Trainer(object):
                         tmp_val = current_memory_usage
                     if current_memory_usage > max_memory_usage:
                         max_memory_usage = current_memory_usage
-                        if max_memory_usage > total_mem_size:
-                            return None, max_memory_usage
+                    if max_memory_usage > total_mem_size:
+                        return None
                 tmp_memory_usage.pop(0)
                 tmp_memory_usage.append(tmp_val)
 
@@ -448,157 +518,221 @@ class Trainer(object):
                         else:
                             break
 
-                return new_swapin_counts, max_memory_usage
+                return new_swapin_counts
 
 
-            def split_forward_timeline(targets):
-            
-                compute_time = 0.0
-                swap_time = 0.0
+            def split_backward_timeline(swapin_counts, backward_times, swapin_times):
 
-                swapout_var_block = list()
-                total_forward_compute_time = sum(forward_times)
-
-                # simulate forward timeline
-                for i in range(len(forward_times)):
-                    compute_time += forward_times[i]
-
-                    if targets[swapout_items[i][2]]:
-                        swap_time = max(compute_time, swap_time) + swapout_items[i][3]
-                        if total_forward_compute_time < swap_time:
-                            swapout_var_block.append(swapout_items[i][2])
-
-                return max(compute_time, swap_time), swapout_var_block
-
-            def split_backward_timeline(targets, swapin_counts):
-
-                # calculate swapin_times
-                swapin_times = num_swapin_timing*[0]
-                for i in range(num_swapin_timing):
-                    items = swapin_items[i]
-                    for item in items:
-                        if targets[item[2]]:
-                            swapin_times[i] += item[3]
-
-                swapin_item_blocks = list()
-                swapin_item_block = list()
-                block_status = None
-
-                swapin_times_count = 0
-                tmp_times = num_swapin_timing*[0]
+                swapin_task_count = 0
+                sync_times = num_swapin_timing*[0]
+                swapin_sync_vars = list()
 
                 # simulate backward timeline
                 compute_time = backward_times[0]
                 swap_time = 0
-                tmp_backward_time = 0.0
                 for j in range(swapin_counts[0]):
-                    swap_time += swapin_times[swapin_times_count]
-                    tmp_times[swapin_times_count] = swap_time
-                    swapin_times_count += 1
+                    swap_time += swapin_times[swapin_task_count]
+                    sync_times[swapin_task_count] = swap_time
+                    swapin_task_count += 1
 
                 for i in range(1, num_swapin_timing):
 
-                    if swapin_times_count == i:
-                        if swap_time < compute_time:
-                            swap_time = compute_time
-                            block_status = True
+                    if swap_time < compute_time:
+                        swap_time = compute_time
                 
                     for j in range(swapin_counts[i]):
-                        swap_time += swapin_times[swapin_times_count]
-                        tmp_times[swapin_times_count] = swap_time
-                        for item in swapin_items[swapin_times_count]:
-                            swapin_item_block.append(item)
-                        swapin_times_count += 1
+                        swap_time += swapin_times[swapin_task_count]
+                        sync_times[swapin_task_count] = swap_time
+                        swapin_task_count += 1
                             
-                    if compute_time < tmp_times[i]:
-                        compute_time = tmp_times[i]
-                        block_status = False
+                    if compute_time < sync_times[i]:
+                        compute_time = sync_times[i]
+                        #swapin_sync_vars.append(i)
 
                     compute_time += backward_times[i]
-                    tmp_backward_time += backward_times[i]
 
-                    if block_status is not None:
-                        swapin_item_blocks.append((swapin_item_block, block_status, tmp_backward_time))
-                        swapin_item_block = list()
-                        block_status = None
-                        tmp_backward_time = 0.0
+                return compute_time, swapin_sync_vars
 
-                if len(swapin_item_block) > 0:
-                    swapin_item_blocks.append((swapin_item_block, True, tmp_backward_time))
 
-                return compute_time, swapin_item_blocks
+            def rebuild_compute_graph(targets):
+                # calculate backward_times and swapin_times, swapin_sizes, recompute_sizes
+                backward_times = num_swapin_timing*[0.0]
+                swapin_times = num_swapin_timing*[0.0]
+                swapin_sizes = num_swapin_timing*[0]
+                recompute_sizes = num_swapin_timing*[None]
+                
+                timing_count = -1
+                current_var_is_retained = dict(var_is_retained)
+                for var in target_vars:
+                    if targets[var] == "keep":
+                        current_var_is_retained[var] = True
+                    else:
+                        current_var_is_retained[var] = False
+                
+                for backward_item in backward_items:
+                    if backward_item[0] == "swapin_timing":
+                        timing_count += 1
+                        recompute_sizes[timing_count] = list()
+                        continue
+                    
+                    backward_times[timing_count] += backward_item[2]
+                    use_vars = list(func_backward_use_vars[backward_item[1]])
+                    
+                    while use_vars:
+                        var = use_vars.pop(0)
 
-            
-            def optimize_swap_targets_main(selected_vars, targets):
+                        swap_flag = (var in target_vars) and (targets[var] == "swap") and not(current_var_is_retained[var])
+                        if swap_flag:
+                            swapin_times[timing_count] += swapin_items[var][1]
+                            swapin_sizes[timing_count] += swapin_items[var][0]
+                        elif not(current_var_is_retained[var]):
+                            # recompute
+                            tmp_func = compute_graph[var]
+                            backward_times[timing_count] += forward_times[tmp_func]
+                            # memory management for recompute
+                            input_var_size = 0
+                            for input_var in compute_graph[tmp_func]:
+                                if not(current_var_is_retained[input_var]):
+                                    if (input_var not in target_vars) or (targets[input_var] != "swap"):
+                                        input_var_size += var_sizes[input_var]
+                            # malloc "output var and workspace" + free "input var and workspace"
+                            tmp_recompute_sizes = [forward_workspace_sizes[tmp_func], var_sizes[var]-forward_workspace_sizes[tmp_func]-input_var_size]
+                            recompute_sizes[timing_count] = tmp_recompute_sizes + recompute_sizes[timing_count]
+
+                            use_vars = list(compute_graph[tmp_func]) + use_vars
+
+                        # update current_var_is_retained
+                        if swap_flag or (var in func_backward_use_vars[backward_item[1]]):
+                            current_var_is_retained[var] = True
+                
+                return backward_times, swapin_times, swapin_sizes, recompute_sizes
+
+
+            def simulate_forward_and_backward(targets):
+                # simulate forward
+                current_memory_usage, forward_total_time, swapout_sync_vars = sync_swapout(targets)
+                # simulate backward
+                backward_times, swapin_times, swapin_sizes, recompute_sizes = rebuild_compute_graph(targets)
+                swapin_counts = compact_swapin(current_memory_usage, num_swapin_timing*[1], swapin_sizes, recompute_sizes)
+                if swapin_counts is None:
+                    return float("inf"), None, None, None
+                backward_total_time, swapin_sync_vars = split_backward_timeline(swapin_counts, backward_times, swapin_times)
+
+                total_time = forward_total_time + backward_total_time
+                return total_time, swapin_counts, swapout_sync_vars, swapin_sync_vars
+
+
+            def optimize_swap_targets_heuristics(selected_vars, targets):
 
                 new_selected_vars = list(selected_vars)
                 current_targets = dict(targets)
 
-                swapin_counts, _ = compact_swapin(targets, num_swapin_timing*[1])
+                total_time, swapin_counts, swapout_sync_vars, swapin_sync_vars = simulate_forward_and_backward(targets)
                 if swapin_counts is None:
-                    return float("inf"), None, None
+                    return float('inf'), None, None
 
-                forward_compute_time, swapout_var_block = split_forward_timeline(targets)
-                backward_compute_time, swapin_item_blocks = split_backward_timeline(targets, swapin_counts)
-                compute_time = forward_compute_time + backward_compute_time
-                
-                for element in swapin_item_blocks[::-1]:
-                    swapin_item_block = element[0]
-                    block_status = element[1]
-                    tmp_backward_time = element[2]
+                swapin_vars = list()
+                # "keep" vs "swap" in backward
+                for swapin_var in swapin_vars:
+                    if swapin_var in new_selected_vars:
+                        continue
+                    new_selected_vars.append(swapin_var)
                     
-                    tmp_swapin_time = 0.0
-                    search_items = list()
-                    for swapin_item in swapin_item_block:
-                        swapin_var = swapin_item[2]
-                        if swapin_var not in new_selected_vars:
-                            new_selected_vars.append(swapin_var)
-                            search_items.append(swapin_item)
-                        if targets[swapin_var]:
-                            tmp_swapin_time += swapin_item[3]
+                    if swapin_var in swapin_sync_vars:
+                        targets[swapin_var] = "keep"
+                        tmp_total_time, tmp_current_targets, tmp_swapin_counts = optimize_swap_targets_heuristics(new_selected_vars, dict(targets))
+                        if total_time > tmp_total_time:
+                            total_time = tmp_total_time 
+                            current_targets = tmp_current_targets
+                            swapin_counts = tmp_swapin_counts
+                    targets[swapin_var] = "swap"
 
-                    if block_status is False:
-                        search_items = list(sorted(search_items, key=lambda x: x[1]))
-                        while tmp_swapin_time > tmp_backward_time:
-                            search_item = search_items.pop(0)
-                            search_var = search_item[2]
-                            tmp_swapin_time -= search_item[3]
-                            
-                            targets[search_var] = False
-                            tmp_compute_time, tmp_current_targets, tmp_swapin_counts = optimize_swap_targets_main(new_selected_vars, dict(targets))
-                            if compute_time > tmp_compute_time:
-                                compute_time = tmp_compute_time 
-                                current_targets = tmp_current_targets
-                                swapin_counts = tmp_swapin_counts
-                                
-                for var in swapout_var_block:
-                    targets[var] = False
-                    tmp_swapin_counts, _ = compact_swapin(targets, num_swapin_timing*[1])
-                    if tmp_swapin_counts is None:
-                        targets[var] = True
-                        tmp_swapin_counts, _ = compact_swapin(targets, num_swapin_timing*[1])
+                # "keep" vs "swap" in forward
+                for swapout_var in swapout_sync_vars[::-1]:
+                    current_targets[swapout_var] = "keep"
+                    _, swapin_counts, _, _ = simulate_forward_and_backward(current_targets)
+                    if swapin_counts is None:
+                        current_targets[swapout_var] = "swap"
                         break
-                        
-                forward_compute_time, _ = split_forward_timeline(targets)
-                backward_compute_time, _ = split_backward_timeline(targets, swapin_counts)
-                tmp_compute_time = forward_compute_time + backward_compute_time
-                if compute_time > tmp_compute_time:
-                    compute_time = tmp_compute_time 
-                    current_targets = targets
-                    swapin_counts = tmp_swapin_counts
-                
-                return compute_time, current_targets, swapin_counts
-            
-            def delay_swapin(targets, current_swapin_counts):
 
-                # calculate swapin_times
-                swapin_times = num_swapin_timing*[0]
-                for i in range(num_swapin_timing):
-                    items = swapin_items[i]
-                    for item in items:
-                        if targets[item[2]]:
-                            swapin_times[i] += item[3]
+                swapout_items = list(filter(lambda item:item[0] in {"swapout"}, log_list))
+                for item in swapout_items[::-1]:
+                    current_targets[item[2]] = "keep"
+                    _, swapin_counts, _, _ = simulate_forward_and_backward(current_targets)
+                    if swapin_counts is None:
+                        current_targets[item[2]] = "swap"
+                        
+                total_time, swapin_counts, _, _ = simulate_forward_and_backward(current_targets)
+                return total_time, current_targets, swapin_counts
+
+
+            def optimize_recompute_targets_heuristics(targets):
+
+                not_selected_vars = list()
+                current_targets = dict(targets)
+
+                for var in target_vars:
+                    if targets[var] != "keep":
+                        not_selected_vars.append(var)
+
+                # "swap" vs "recompute"
+                while not_selected_vars:
+                    min_ratio = float('inf')
+                    best_var = None
+                    remove_vars = list()
+                    
+                    for var in not_selected_vars:
+                        current_targets[var] = "swap"
+                        swap_case_time, _, _, _ = simulate_forward_and_backward(current_targets)
+                        tmp1 = swapout_items[var]
+                        tmp2 = swapin_items[var]
+                        swapout_items[var] = (var_sizes[var], 0.0)
+                        swapin_items[var] = (var_sizes[var], 0.0)
+                        retain_case_time, _, _, _ = simulate_forward_and_backward(current_targets)
+                        swap_overhead = swap_case_time - retain_case_time
+                        swapout_items[var] = tmp1
+                        swapin_items[var] = tmp2
+                        
+                        current_targets[var] = "keep"
+                        retain_case_time = sum(rebuild_compute_graph(current_targets)[0])
+                        current_targets[var] = "recompute"
+                        _, swapin_counts, _, _ = simulate_forward_and_backward(current_targets)
+                        if swapin_counts is not None:
+                            recompute_case_time = sum(rebuild_compute_graph(current_targets)[0])
+                        else:
+                            recompute_case_time = float('inf')
+                        recompute_overhead = recompute_case_time - retain_case_time
+
+                        
+                        if swap_overhead == 0:
+                            remove_vars.append(var)
+                        else:
+                            tmp_ratio = recompute_overhead / swap_overhead
+                            #print(swap_overhead, recompute_overhead, tmp_ratio)
+                            if tmp_ratio >= 1.0:
+                                remove_vars.append(var)
+                            elif min_ratio > tmp_ratio:
+                                min_ratio = tmp_ratio
+                                best_var = var
                             
+                        current_targets[var] = "swap"
+
+                    if best_var is not None:
+                        current_targets[best_var] = "recompute"
+                        not_selected_vars.remove(best_var)
+                    else:
+                        break
+                    #print(len(not_selected_vars), len(remove_vars))
+                    while remove_vars:
+                        not_selected_vars.remove(remove_vars.pop())
+                
+                total_time, swapin_counts, _, _ = simulate_forward_and_backward(current_targets)
+                return total_time, current_targets, swapin_counts
+
+
+            def delay_swapin(targets, current_swapin_counts):
+                backward_times, swapin_times, _, _ = rebuild_compute_graph(targets)
+            
                 swapin_blocks = list()
                 swapin_block_start = 0
                 swapin_block_end = 0
@@ -626,13 +760,13 @@ class Trainer(object):
                     k = current_backward
                     tmp2 = backward_times[k]
 
-                    while j >= swapin_block[0]:
+                    while j >= swapin_block[0] and k >= swapin_block[2]:
                         while k >= j:
                             tmp1 = swapin_times[j]
                             k -= 1
                             tmp2 = backward_times[k]
                             backward_block_time -= backward_times[k]
-
+                        
                         if tmp1 <= tmp2:
                             if swapin_block_time <= backward_block_time:
                                 swapin_counts[k] += 1
@@ -640,43 +774,121 @@ class Trainer(object):
                             j -= 1
                             tmp1 += swapin_times[j]
                             swapin_block_time -= swapin_times[j]
+                        elif swapin_block_time >= backward_block_time:
+                            swapin_counts[k] += 1
+                            swapin_counts[swapin_block[2]] -= 1
+                            j -= 1
+                            tmp1 += swapin_times[j]
+                            swapin_block_time -= swapin_times[j]
                         else:
                             k -= 1
                             tmp2 += backward_times[k]
                             backward_block_time -= backward_times[k]
+                            
                     current_backward = k-1
                             
                 return swapin_counts
-            
-            
-            execution_time = time.time()
 
+            def optimize_targets_superneurons():
+                targets = dict(zip(target_vars, len(target_vars)*["swap"]))
+                swapout_items = list(filter(lambda item:item[0] in {"swapout"}, log_list))
+                for item in swapout_items[::-1]:
+                    targets[item[2]] = "keep"
+                    _, swapin_counts, _, _ = simulate_forward_and_backward(targets)
+                    if swapin_counts is None:
+                        targets[item[2]] = "swap"
+                        break
+
+                for var in target_vars:
+                    if targets[var] == "swap":
+                        if compute_graph[var].count("convolution") == 0 and compute_graph[var].count("FunctionAdapter") == 0:
+                            targets[var] = "recompute"
+                
+                backward_items = list(filter(lambda item:item[0] in {"backward", "swapin_timing"}, log_list))
+                conv_layers = list()
+                timing_count = -1
+                for item in backward_items:
+                    if item[0] == "swapin_timing":
+                        timing_count += 1
+                    elif item[0] == "backward":
+                        if item[1].count("convolution") > 0 or item[1].count("FunctionAdapter") > 0:
+                            if len(conv_layers) > 0 and conv_layers[-1] == timing_count:
+                                continue
+                            conv_layers.append(timing_count)
+                conv_layers.append(num_swapin_timing)
+
+                swapin_counts = num_swapin_timing*[0]
+                current_layer = 0
+                tmp_layer = 0
+                for conv_layer in conv_layers:
+                    while current_layer < conv_layer:
+                        swapin_counts[tmp_layer] += 1
+                        current_layer += 1
+                    tmp_layer = conv_layer
+                return targets, swapin_counts
+
+            # optimize targets and swapin_counts
+            start_time = time.time()
+            optimize_setting = variable.ooc_optimize_setting
+            print(optimize_setting)
+            
             initial_vars = list()
-            initial_targets = dict(zip(seen_vars, len(seen_vars)*[True]))
-            best_time, best_targets, best_swapin_counts = optimize_swap_targets_main(initial_vars, initial_targets)
-            
-            best_swapin_counts = delay_swapin(best_targets, best_swapin_counts)
-            
-            # for comparison with original chainer or chainer_ooc
-            #for var in seen_vars:
-            #    best_targets[var] = True
-            #    best_targets[var] = False
-            #best_swapin_counts = num_swapin_timing*[1]
-            #best_swapin_counts[0] = 2
-            #best_swapin_counts[num_swapin_timing-1] = 0
-            
-            self.is_swap_targets = list()
+            best_targets = dict(zip(target_vars, len(target_vars)*["swap"]))
+            best_swapin_counts = num_swapin_timing*[1]
+            best_time = float("inf")
+
+            if optimize_setting is None:
+                best_time, best_targets, best_swapin_counts = optimize_swap_targets_heuristics(initial_vars, best_targets)
+                best_time, best_targets, best_swapin_counts = optimize_recompute_targets_heuristics(best_targets)
+                best_swapin_counts = delay_swapin(best_targets, best_swapin_counts)
+            elif optimize_setting == 'superneurons':
+                best_targets, best_swapin_counts = optimize_targets_superneurons()
+            elif optimize_setting == 'keep_all':
+                best_targets = dict(zip(target_vars, len(target_vars)*["keep"]))
+            elif optimize_setting == 'swap_all_no_scheduling':
+                best_targets = dict(zip(target_vars, len(target_vars)*["swap"]))
+                best_swapin_counts = num_swapin_timing*[1]
+                for i in range(num_swapin_timing-1):
+                    best_swapin_counts[i] += 1
+                    best_swapin_counts[i+1] -= 1
+                    cm, _, _ = sync_swapout(best_targets)
+                    _, _, ss, rs = rebuild_compute_graph(best_targets)
+                    if compact_swapin(cm, best_swapin_counts, ss, rs) is None:
+                        best_swapin_counts[i] -= 1
+                        best_swapin_counts[i+1] += 1
+            elif optimize_setting == 'swap_all':
+                best_targets = dict(zip(target_vars, len(target_vars)*["swap"]))
+                _, best_swapin_counts, _, _ = simulate_forward_and_backward(best_targets)
+                best_swapin_counts = delay_swapin(best_targets, best_swapin_counts)
+            elif optimize_setting == 'swap_opt':
+                best_time, best_targets, best_swapin_counts = optimize_swap_targets_heuristics(initial_vars, best_targets)
+                best_swapin_counts = delay_swapin(best_targets, best_swapin_counts)
+            elif optimize_setting == 'recompute_all':
+                best_targets = dict(zip(target_vars, len(target_vars)*["recompute"]))
+
+            #print()
+            #print(rebuild_compute_graph(best_targets)[2])
+            #print(rebuild_compute_graph(best_targets)[3])
+            #print()
+        
+            #print("optimize_time: ", time.time() - start_time)
+
+            self.is_targets = list()
             if best_targets is not None:
-                while len(seen_vars):
-                    var = seen_vars.pop(0)
-                    self.is_swap_targets.append((best_targets[var], swapout_var_sizes[var]))
+                self.is_targets = [(best_targets[var], var_sizes[var]) for var in target_vars]
             self.swapin_counts = best_swapin_counts
-            #print(self.is_swap_targets.append)
-            #print(self.swapin_counts)
+            print("targets = ", self.is_targets)
+            print("swapin_counts = ", self.swapin_counts)
+            #print("best_time: ",best_time)
+            print()
 
         memory_pool.set_profile_mode(self.updater.iteration == 2)
         memory_pool.memory_log_reset()
-        variable.is_swap_targets = list(self.is_swap_targets)
+        function_node.compute_graph = {}
+        function_node.var_size = {}
+        function_node.func_backward_use_vars = {}
+
+        variable.is_targets = list(self.is_targets)
         variable.swapin_counts = list(self.swapin_counts)
 
     def run(self, show_loop_exception_msg=True):

@@ -47,7 +47,7 @@ class ConvolutionND(link.Link):
 
     """
 
-    def __init__(self, ndim, in_channels, out_channels, ksize, stride=1, pad=0,
+    def __init__(self, ndim, in_channels, out_channels, ksize, stride=1, pad=0, groups=1,
                  nobias=False, initialW=None, initial_bias=None,
                  cover_all=False):
         super(ConvolutionND, self).__init__()
@@ -56,6 +56,7 @@ class ConvolutionND(link.Link):
         self.stride = stride
         self.pad = pad
         self.cover_all = cover_all
+        self.groups = groups
 
         with self.init_scope():
             W_shape = (out_channels, in_channels) + ksize
@@ -81,4 +82,4 @@ class ConvolutionND(link.Link):
 
         """
         return convolution_nd.convolution_nd(
-            x, self.W, self.b, self.stride, self.pad, cover_all=self.cover_all)
+            x, self.W, self.b, self.stride, self.pad, cover_all=self.cover_all, groups=self.groups)

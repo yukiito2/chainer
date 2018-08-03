@@ -25,6 +25,7 @@ class Sum(function_node.FunctionNode):
             raise TypeError('None, int or tuple of int are required')
 
         self.keepdims = keepdims
+        self.inputs_shape = None
 
     def check_type_forward(self, in_types):
         type_check.expect(
@@ -45,6 +46,7 @@ class Sum(function_node.FunctionNode):
 
     def forward(self, inputs):
         x, = inputs
+        self.inputs_shape = x.shape
         ret = x.sum(axis=self.axis, keepdims=self.keepdims)
         if cuda.get_array_module(x) is numpy:
             ret = numpy.asarray(ret)
@@ -52,7 +54,7 @@ class Sum(function_node.FunctionNode):
 
     def backward(self, indexes, grad_outputs):
         gy, = grad_outputs
-        ndim = len(self.inputs[0].shape)
+        ndim = len(self.inputs_shape)
         if not (ndim == 0 or self.axis is None or self.keepdims):
             actual_axis = [
                 axis if axis >= 0 else axis + ndim
@@ -61,7 +63,7 @@ class Sum(function_node.FunctionNode):
             for axis in sorted(actual_axis):
                 shape.insert(axis, 1)
             gy = chainer.functions.reshape(gy, shape)
-        return chainer.functions.broadcast_to(gy, self.inputs[0].shape),
+        return chainer.functions.broadcast_to(gy, self.inputs_shape),
 
 
 def sum(x, axis=None, keepdims=False):

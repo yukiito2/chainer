@@ -23,21 +23,17 @@ from chainer import training
 from chainer.training import extensions
 from chainer.training import updaters
 
-import alex
-import googlenet
-import googlenetbn
-import nin
-import resnet50
-import resnext101
-import vgg
-import train_imagenet
+import C3D
+import resnext101_3d
 
 class PreprocessedDataset(chainer.dataset.DatasetMixin):
 
-    def __init__(self, mean, crop_size, random=True):
+    def __init__(self, mean, height, width, length, random=True):
         #self.base = chainer.datasets.LabeledImageDataset(path, root)
         self.mean = mean.astype('f')
-        self.crop_size = crop_size
+        self.height = height
+        self.width = width
+        self.length = length
         self.random = random
 
     def __len__(self):
@@ -49,31 +45,25 @@ class PreprocessedDataset(chainer.dataset.DatasetMixin):
         #     - Cropping (random or center rectangular)
         #     - Random flip
         #     - Scaling to [0, 1] value
-        crop_size = self.crop_size
+        height = self.height
+        width = self.width
+        length = self.length
 
-        image = np.random.rand(3, crop_size, crop_size)
+        image = np.random.rand(3, length, height, width)
         label = np.array(1, np.int32)
         
         image = image.astype(np.float32)
-        label *= random.randint(0, 99)
+        label *= random.randint(0, 10)
 
         return image, label
 
 
 def main():
     archs = {
-        'alex': alex.Alex,
-        'alex_fp16': alex.AlexFp16,
-        'googlenet': googlenet.GoogLeNet,
-        'googlenetbn': googlenetbn.GoogLeNetBN,
-        'googlenetbn_fp16': googlenetbn.GoogLeNetBNFp16,
-        'nin': nin.NIN,
-        'resnet50': resnet50.ResNet50,
-        'resnext101': resnext101.ResNeXt101,
-        'vgg': vgg.VGGNet
+        'c3d': C3D.C3D,
+        'resnext101': resnext101_3d.ResNeXt101
     }
     optimize_settings = ['keep_all', 'swap_all_no_scheduling', 'swap_all', 'recompute_all', 'swap_opt', 'superneurons']
-
 
     parser = argparse.ArgumentParser(
         description='Learning convnet from ILSVRC2012 dataset')
@@ -83,6 +73,12 @@ def main():
                         default='nin', help='Convnet architecture')
     parser.add_argument('--batchsize', '-B', type=int, default=32,
                         help='Learning minibatch size')
+    parser.add_argument('--height', '-H', type=int, default=224,
+                        help='input height')
+    parser.add_argument('--width', '-W', type=int, default=224,
+                        help='input width')
+    parser.add_argument('--length', '-L', type=int, default=32,
+                        help='input length')
     parser.add_argument('--epoch', '-E', type=int, default=10,
                         help='Number of epochs to train')
     parser.add_argument('--iteration', '-i', type=int, default=0,
@@ -132,8 +128,8 @@ def main():
 
     # Load the datasets and mean file
     mean = np.load(args.mean)
-    train = PreprocessedDataset(mean, model.insize)
-    val = PreprocessedDataset(mean, model.insize, False)
+    train = PreprocessedDataset(mean, args.height, args.width, args.length)
+    val = PreprocessedDataset(mean, args.height, args.width, args.length, False)
     # These iterators load the images with subprocesses running in parallel to
     # the training/validation.
 

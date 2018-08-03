@@ -30,7 +30,7 @@ class Deconvolution2DFunction(function_node.FunctionNode):
 
     cover_all = None
 
-    def __init__(self, stride=1, pad=0, outsize=None, **kwargs):
+    def __init__(self, stride=1, pad=0, outsize=None, groups=1, **kwargs):
         argument.check_unexpected_kwargs(
             kwargs,
             deterministic="deterministic argument is not supported anymore. "
@@ -46,6 +46,7 @@ class Deconvolution2DFunction(function_node.FunctionNode):
         self.sy, self.sx = _pair(stride)
         self.ph, self.pw = _pair(pad)
         self.outh, self.outw = (None, None) if outsize is None else outsize
+        self.groups = groups
 
     def check_type_forward(self, in_types):
         n_in = in_types.size()
@@ -163,7 +164,7 @@ class Deconvolution2DFunction(function_node.FunctionNode):
 
             filter_desc = cudnn.create_filter_descriptor(W)
             conv_desc = cudnn.create_convolution_descriptor(
-                (self.ph, self.pw), (self.sy, self.sx), x.dtype)
+                (self.ph, self.pw), (self.sy, self.sx), x.dtype, groups=self.groups)
             if b is not None:
                 bias_desc = cudnn.create_tensor_descriptor(
                     b[None, :, None, None])
@@ -237,7 +238,7 @@ class Deconvolution2DFunction(function_node.FunctionNode):
             in_w != conv.get_conv_outsize(self.outw, kw, self.sx, self.pw))
 
 
-def deconvolution_2d(x, W, b=None, stride=1, pad=0, outsize=None, **kwargs):
+def deconvolution_2d(x, W, b=None, stride=1, pad=0, outsize=None, groups=1, **kwargs):
     """deconvolution_2d(x, W, b=None, stride=1, pad=0, outsize=None)
 
     Two dimensional deconvolution function.
@@ -344,7 +345,7 @@ http://www.matthewzeiler.com/pubs/cvpr2010/cvpr2010.pdf
         "context where value is either `True` or `False`.")
     argument.assert_kwargs_empty(kwargs)
 
-    func = Deconvolution2DFunction(stride, pad, outsize)
+    func = Deconvolution2DFunction(stride, pad, outsize, groups=groups)
     if b is None:
         args = x, W
     else:

@@ -5,6 +5,7 @@ import traceback
 import warnings
 import weakref
 import threading
+import gc
 
 import numpy
 
@@ -17,12 +18,11 @@ from chainer.utils import argument
 from chainer import configuration
 from chainer.cuda import memory_pool
 
-# for measurement computation time
-swap_events = list()
 # control whether to swap or not
-is_swap_targets = list()
+is_targets = list()
 # control swap-in timing
 swapin_counts = list()
+ooc_optimize_setting = None
 
 def _check_grad_type(func, x, gx):
     if x.data is None or gx is None:
@@ -128,13 +128,15 @@ def _add_instance(instances, seen_set, instance):
 
 
 def out_of_core_mode(async=True, fine_granularity=False, debug=False,
-                     devices=None):
+                     devices=None, optimize_setting=None):
     """Enable out of core training mode
 
     Originally from anaruse's repository
     Source: https://github.com/anaruse/
             chainer/blob/OOC_chainer_v202/chainer/variable.py
     """
+    global ooc_optimize_setting
+
     events = []
     streams = []
     if devices is None:
@@ -148,6 +150,9 @@ def out_of_core_mode(async=True, fine_granularity=False, debug=False,
                 streams.append(cuda.Stream.null)
                 streams.append(cuda.Stream.null)
 
+    if optimize_setting in ['keep_all', 'swap_all_no_scheduling', 'swap_all', 'recompute_all', 'swap_opt', 'superneurons']:
+        ooc_optimize_setting = optimize_setting
+        
     return configuration.using_config('out_of_core_params',
                                       [True, async,
                                        fine_granularity, streams,
@@ -221,7 +226,8 @@ class VariableNode(object):
         # It is used to do backpropagation again from this node
         self._grad_var = None
         self._is_data_swapout = False
-        self.is_swap_target = None
+        self.is_target = None
+        self.already_swapin = False
 
     @property
     def creator(self):
@@ -436,22 +442,18 @@ class VariableNode(object):
                 'cannot twice-differentiate an old style Function "%s"' %
                 self._old_style_grad_generator)
             
-    def ancestors_free(self, stream=None, inclusive=False, early_stop=False):
-        if early_stop:
-            ancestor_vnodes = self.ancestors_whose_data_on_gpu()
-        else:
-            ancestor_vnodes = self.ancestors()
-        if inclusive:
-            ancestor_vnodes.append(self)
+    def ancestors_free(self):
+        ancestor_vnodes = self.ancestors()
+        ancestor_vnodes.append(self)
         
         for vnode in ancestor_vnodes:
             if vnode.creator is None:
                 continue
             variable = vnode._variable()
-            if variable is None:
-                if self.data is not None:
-                    self.data.free_data()
-
+            if variable is None and vnode.data is not None:
+                vnode.data.free_data()
+                vnode.data = None
+                
     def ancestors_swapout(self, stream=None, inclusive=False,
                           early_stop=False, events=None, debug=False):
         """...
@@ -473,25 +475,7 @@ class VariableNode(object):
         for vnode in ancestor_vnodes:
             if vnode.creator is None:
                 continue
-
             vnode.to_swap(stream=stream, events=events, debug=debug)
-            
-    def ancestors_swapout_bytes(self, stream=None, inclusive=False,
-                          early_stop=False, events=None, debug=False):
-        
-        if early_stop:
-            ancestor_vnodes = self.ancestors_whose_data_on_gpu()
-        else:
-            ancestor_vnodes = self.ancestors()
-        if inclusive:
-            ancestor_vnodes.append(self)
-        swapout_bytes = 0
-        for vnode in ancestor_vnodes:
-            if vnode.creator is None:
-                continue
-            if vnode._data is not None:
-                swapout_bytes += vnode._data.nbytes
-        return swapout_bytes
 
     def ancestors_swapin(self, stream=None, inclusive=False,
                          debug=False):
@@ -501,7 +485,7 @@ class VariableNode(object):
         Source: https://github.com/anaruse/
                 chainer/blob/OOC_chainer_v202/chainer/variable.py
         """
-        ancestor_vnodes = self.ancestors()
+        ancestor_vnodes = self.ancestors_for_recompute()
         if inclusive:
             ancestor_vnodes.append(self)
         if debug:
@@ -513,13 +497,14 @@ class VariableNode(object):
             
     def ancestors_swapin_bytes(self, stream=None, inclusive=False,
                          debug=False):
-        ancestor_vnodes = self.ancestors()
+        ancestor_vnodes = self.ancestors_for_recompute(True)
         if inclusive:
             ancestor_vnodes.append(self)
         swapin_bytes = 0
         for vnode in ancestor_vnodes:
-            if vnode._is_data_swapout is True:
-                swapin_bytes += vnode._data.nbytes
+            if (vnode._is_data_swapout is True) and (vnode.already_swapin is False):
+                swapin_bytes += vnode._data.nbytes 
+                vnode.already_swapin = True
         return swapin_bytes
 
     def ancestors(self):
@@ -560,11 +545,67 @@ class VariableNode(object):
         while ancestor_funcs:
             func = ancestor_funcs.pop()
             for vnode in func.inputs:
-                if vnode._is_data_swapout is False and vnode.is_swap_target is not False:
+                #if vnode._is_data_swapout is False and vnode.is_target is not "keep":
+                if vnode.is_target is not "keep":
                     _add_instance(ancestor_vnodes, seen_vnodes, vnode)
                     _add_instance(ancestor_funcs, seen_funcs, vnode.creator_node)
 
         return ancestor_vnodes
+
+    def ancestors_for_recompute(self, swapin_bytes_mode=False):
+        ancestor_vnodes = []
+
+        def trace_break_points(vnode):
+            seen_vnodes = set()
+            funcs = []
+            seen_funcs = set()
+
+            seen_vnodes.add(vnode)
+            func = vnode._creator_node_g
+            if func is not None:
+                funcs.append(func)
+                seen_funcs.add(func)
+            
+            while funcs:
+                func = funcs.pop()
+                for new_vnode in func.inputs:
+                    if (new_vnode.data is not None) or (new_vnode.is_target == "recompute"):
+                        return seen_funcs
+
+                    if new_vnode in seen_vnodes:
+                        continue
+                    seen_vnodes.add(new_vnode)
+                    
+                    new_func = new_vnode._creator_node_g
+                    if new_func not in seen_funcs and new_func is not None:
+                        funcs.append(new_func)
+                        seen_funcs.add(new_func)
+            return seen_funcs
+
+        def trace_recompute(vnode):
+            new_vnodes = [vnode]
+
+            if vnode.data is None:
+                # for controle swapin vars
+                if swapin_bytes_mode and vnode.already_swapin:
+                    return new_vnodes
+
+                tmp_func = vnode._creator_node_g
+                for x in tmp_func.inputs:
+                    new_vnodes += trace_recompute(x)
+            return new_vnodes
+
+        for func in trace_break_points(self):
+            if func._input_indexes_to_retain is not None:
+                for index in func._input_indexes_to_retain:
+                    ancestor_vnodes += trace_recompute(func.inputs[index])
+
+            if func._output_indexes_to_retain is not None:
+                for index in func._output_indexes_to_retain:
+                    ancestor_vnodes += trace_recompute(func.outputs[index]())
+
+        return ancestor_vnodes
+
 
     def to_swap(self, stream=None, events=None,
                 debug=False, force=False):
@@ -587,34 +628,28 @@ class VariableNode(object):
                 if debug:
                     print('# variable.py:377, to_swap(), {} {}'.format(
                         self, self._creator_node))
-                    
-                # check whether to swap or not
-                if self.is_swap_target is None:
-                    if len(is_swap_targets) == 0:
-                        self.is_swap_target = True
-                    elif self.data.nbytes == is_swap_targets[0][1]:
-                        self.is_swap_target = is_swap_targets.pop(0)[0]
-                    else:
-                        self.is_swap_target = False
-                if self.is_swap_target is False:
-                    return
                 
+                # check whether to swap or not
+                if self.is_target is None:
+                    if len(is_targets) == 0:
+                        self.is_target = "swap"
+                    elif self.data.nbytes == is_targets[0][1]:
+                        self.is_target = is_targets.pop(0)[0]
+                    else:
+                        self.is_target = "keep"
+
+                if self.is_target == "recompute":
+                    self.data.free_data()
+                    self.data = None
+                    return
+                elif self.is_target != "swap":
+                    return
+
                 if memory_pool.get_profile_mode() and stream is not None:
                     memory_pool.memory_log_add(("swapout", self.data.nbytes, str(self), str(self.data.data.ptr)))
-                    start_event = stream.record()
-                
-                self._data = cuda.to_swap(self.data, stream=stream)  
-                
-                if memory_pool.get_profile_mode() and stream is not None:
-                    end_event = stream.record()
-                    swap_events.append(("swapout", str(self), start_event, end_event))
-                
-                if stream is not None and events is not None:
-                    event = stream.record()
-                    events.append(event)
-                    memory_pool.add_swapout_event(event)
+                self._data = cuda.to_swap(self.data, stream=stream)
                 self._is_data_swapout = True
-                
+
     def to_gpu(self, stream=None, events=None,
                debug=False):
         """Copies the data and gradient arrays to GPU memory.
@@ -628,19 +663,11 @@ class VariableNode(object):
             if self._is_data_swapout is True:
                 if debug:
                     print('# variable.py:389, to_gpu(), {}'.format(self))
-                    
+
                 if memory_pool.get_profile_mode() and stream is not None:
                     memory_pool.memory_log_add(("swapin", self.data.nbytes, str(self)))
-                    start_event = stream.record()
-                    
+
                 self._data = cuda.to_gpu(self.data, stream=stream)
-                
-                if memory_pool.get_profile_mode() and stream is not None:
-                    end_event = stream.record()
-                    swap_events.append(("swapin", str(self), start_event, end_event))
-                    
-                if stream is not None and events is not None:
-                    events.append(stream.record())
                 self._is_data_swapout = False
 
     def interrupt_backward(self):
@@ -776,7 +803,7 @@ class VariableNode(object):
                     # print('# variable.py:445, user set break point: {}'
                     #       .format(vnode))
 
-                if fine_granularity and vnode.data is not None:
+                if fine_granularity and ((vnode.data is not None) or (vnode.is_target == "recompute")):
                     add_break_point(vnode)
 
                 if vnode not in seen_vnodes:
@@ -849,6 +876,9 @@ Actual: {0}'''.format(type(data))
         self._requires_grad = requires_grad
         self._node = VariableNode(self, name)
         self._grad_var = None if grad is None else Variable(grad)
+        self.data_size = 0
+        if self.data is not None:
+            self.data_size = self.data.size
 
     def __copy__(self):
         return self._copy_to(Variable())
@@ -1256,8 +1286,12 @@ Actual: {0}'''.format(type(data))
             [False, True, False, [None, None], [], False])
 
         if ooc_enabled:
+            streams[0].synchronize()
             while events:
                 events.pop(0).synchronize()
+
+        #if memory_pool.get_profile_mode():
+        memory_pool.memory_log_add(("forward_to_backward", ))
 
         # [OOC/LWR]
         break_points = self.node.get_break_points(fine_granularity)
@@ -1294,7 +1328,6 @@ Actual: {0}'''.format(type(data))
                 print('#     used_bytes: {}'.format(memory_pool.used_bytes()))
                 root_node._show_memory_usage()
                 """
-            
             # swapin
             if ooc_enabled:
                 if memory_pool.get_profile_mode():
@@ -1303,22 +1336,26 @@ Actual: {0}'''.format(type(data))
                 # for profiling step
                 if len(swapin_counts) == 0:
                     swapin_counts.append(1)
-
+                
                 swapin_count = swapin_counts.pop(0)         
                 for count in range(swapin_count):
                     if len(bp_swapin_heap) > 0:
                         _, _, bp_swapin = heapq.heappop(bp_swapin_heap)
-                        
+                             
                         swapin_bytes = bp_swapin.ancestors_swapin_bytes(stream=streams[0], inclusive=True, debug=ooc_debug)
                         if swapin_bytes > 0:
+                            #print(len(bp_swapin_heap), swapin_bytes)
                             swapin_thread = threading.Thread(target=schedule_swapin, args=(bp_swapin, swapin_task_count))
                             swapin_thread.start()
+                            #bp_swapin.ancestors_swapin(stream=streams[0], inclusive=True, debug=ooc_debug)
+                            #events_swapin.append(streams[0].record())
+                            #thread_events[swapin_task_count].set()
                         else:
                             events_swapin.append(None)
                             thread_events[swapin_task_count].set()
 
                         swapin_task_count += 1
-            
+
             if ooc_async is False:
                 cuda.Stream.null.synchronize()
                   
@@ -1336,10 +1373,10 @@ Actual: {0}'''.format(type(data))
                 bp_var._grad_var = bp._grad_var
             bp_var._backward(retain_grad, enable_double_backprop, root_node)
 
-            if ooc_enabled and len(break_points) > 0:
+            if ooc_enabled:
                 cuda.Stream.null.synchronize()
                 # streams[1].wait_event(cuda.Stream.null.record())
-                bp.ancestors_free(stream=streams[1], inclusive=True)
+                bp.ancestors_free()
                
             if ooc_async is False:
                 cuda.Stream.null.synchronize()
@@ -1351,6 +1388,7 @@ Actual: {0}'''.format(type(data))
         if ooc_enabled:
             streams[0].synchronize()
             streams[1].synchronize()
+
 
     def _backward(self, retain_grad, enable_double_backprop, root_node):
         """Runs error backpropagation (a.k.a.\\  backprop) from this variable.
@@ -1413,7 +1451,7 @@ Actual: {0}'''.format(type(data))
         grads = {}
 
         # Initialize error by 1, if this is a loss variable
-        if self.data.size == 1 and self._grad_var is None:
+        if self.data_size == 1 and self._grad_var is None:
             with cuda.get_device_from_array(self.data) as device:
                 if device is cuda.DummyDevice:
                     self.grad = numpy.ones_like(self.data)
@@ -1436,6 +1474,25 @@ Actual: {0}'''.format(type(data))
                 return grads[node]
             return node.grad_var
 
+        # depthはあとで削除(debug用に)
+        def recompute_data(vnode, depth=0):
+            if vnode.data is not None:
+                return vnode.data
+            
+            tmp_func = vnode._creator_node_g
+            #print(depth, str(vnode.data.__class__), vnode.is_target)
+            #print(str(tmp_func))
+            tmp_inputs = tmp_func.inputs
+            tmp_in_data = tuple([recompute_data(x, depth+1) for x in tmp_inputs])
+
+            #print("recompute: ", str(tmp_func))
+            tmp_outputs = [y() for y in tmp_func.outputs]
+            output_index = tmp_outputs.index(vnode)
+            tmp_out_data = tmp_func.forward(tmp_in_data)[output_index]
+
+            gc.collect()
+            return tmp_out_data
+
         while cand_funcs:
             _, _, func = heapq.heappop(cand_funcs)
             inputs = func.inputs
@@ -1445,6 +1502,19 @@ Actual: {0}'''.format(type(data))
             if not target_input_indexes:
                 continue
             outputs = [y() for y in func.outputs]  # access via weak ref
+
+            # recompute for inputs and outputs
+            #print("recompute inputs: ", func._input_indexes_to_retain)
+            if func._input_indexes_to_retain is not None:
+                for index in func._input_indexes_to_retain:
+                    inputs[index].data = recompute_data(inputs[index])
+            #print("recompute outputs: ", func._output_indexes_to_retain)
+            if func._output_indexes_to_retain is not None:
+                retained_data = []
+                for index in func._output_indexes_to_retain:
+                    outputs[index].data = recompute_data(outputs[index])
+                    retained_data.append(outputs[index].data)
+                func._retained_output_data = tuple(retained_data)
 
             in_data = tuple([x.data for x in inputs])
             out_grad = tuple([get_grad(y) for y in outputs])
@@ -1494,9 +1564,11 @@ Actual: {0}'''.format(type(data))
                 else:
                     gx = None
                 in_grad.append(gx)
-
+            
+            #print("backward: ", str(func), [x.data.__class__.__name__ for x in func.inputs], [y().data.__class__.__name__ for y in func.outputs])
             gxs = func.backward_accumulate(
                 target_input_indexes, out_grad, in_grad)
+            
 
             assert len(gxs) == len(in_grad)
             for hook in hooks:

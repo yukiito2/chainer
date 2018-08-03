@@ -21,13 +21,14 @@ if cuda.cudnn_enabled:
 
 class DeconvolutionND(function.Function):
 
-    def __init__(self, ndim, stride=1, pad=0, outsize=None):
+    def __init__(self, ndim, stride=1, pad=0, outsize=None, groups=1):
         self.ndim = ndim
         self.stride = conv_nd.as_tuple(stride, ndim)
         self.pad = conv_nd.as_tuple(pad, ndim)
         if outsize is not None:
             assert len(outsize) == ndim
         self.outs = outsize
+        self.groups = groups
 
     def check_type_forward(self, in_types):
         n_in = in_types.size()
@@ -121,7 +122,7 @@ class DeconvolutionND(function.Function):
         y_desc = cudnn.create_tensor_descriptor(y)
         self.filter_desc = cudnn.create_filter_descriptor(W)
         self.conv_desc = cudnn.create_convolution_descriptor(
-            self.pad, self.stride, x.dtype)
+            self.pad, self.stride, x.dtype, groups=self.groups)
         if b is not None:
             b_index = (None, colon) + (None,) * ndim
             self.bias_desc = cudnn.create_tensor_descriptor(b[b_index])
@@ -277,7 +278,7 @@ class DeconvolutionND(function.Function):
             return self._backward_xp(x, W, b, gy, cuda.cupy)
 
 
-def deconvolution_nd(x, W, b=None, stride=1, pad=0, outsize=None):
+def deconvolution_nd(x, W, b=None, stride=1, pad=0, outsize=None, groups=1):
     """N-dimensional deconvolution function.
 
     This is an implementation of N-dimensional deconvolution which generalizes
@@ -415,7 +416,7 @@ pad=(p1, p2, p3), outsize=(l1, l2, l3))
 
     """
     ndim = len(x.shape[2:])
-    func = DeconvolutionND(ndim, stride, pad, outsize)
+    func = DeconvolutionND(ndim, stride, pad, outsize, groups=groups)
     if b is None:
         return func(x, W)
     else:

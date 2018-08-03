@@ -17,6 +17,7 @@ class Concat(function_node.FunctionNode):
             raise TypeError('axis must be int')
 
         self.axis = axis
+        self.sizes = None
 
     def check_type_forward(self, in_types):
         type_check.expect(in_types.size() > 0)
@@ -41,22 +42,25 @@ class Concat(function_node.FunctionNode):
 
     def forward(self, xs):
         xp = cuda.get_array_module(*xs)
+        self.sizes = numpy.array([v.shape[self.axis] for v in xs[:-1]]).cumsum()
         return xp.concatenate(xs, self.axis),
 
     def backward(self, indexes, grad_outputs):
         if len(self.inputs) == 1:
             return grad_outputs
 
-        sizes = numpy.array(
-            [v.shape[self.axis] for v in self.inputs[:-1]]
-        ).cumsum()
+        if self.sizes is None:
+            sizes = numpy.array(
+                [v.shape[self.axis] for v in self.inputs[:-1]]
+            ).cumsum()
+        else:
+            sizes = self.sizes
         gx, = grad_outputs
         return chainer.functions.split_axis(gx, sizes, self.axis)
 
 
 def concat(xs, axis=1):
     """Concatenates given variables along an axis.
-
     Args:
         xs (tuple of :class:`~chainer.Variable` or :class:`numpy.ndarray` or \
         :class:`cupy.ndarray`):
@@ -64,12 +68,9 @@ def concat(xs, axis=1):
             same shape, except in the dimension corresponding to axis.
         axis (int): The axis along which the arrays will be joined. Default \
             is 1.
-
     Returns:
         ~chainer.Variable: The concatenated variable.
-
     .. admonition:: Example
-
         >>> x = np.arange(0, 12).reshape(3, 4)
         >>> x
         array([[ 0,  1,  2,  3],
@@ -85,7 +86,6 @@ def concat(xs, axis=1):
         array([[ 0,  1,  2,  3,  0],
                [ 4,  5,  6,  7,  1],
                [ 8,  9, 10, 11,  2]])
-
     """
     y, = Concat(axis).apply(xs)
     return y

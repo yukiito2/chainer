@@ -54,7 +54,6 @@ class BatchNormalization(function_node.FunctionNode):
             self.running_mean = xp.zeros_like(gamma)
             self.running_var = xp.zeros_like(gamma)
         self.mode = _BNMode(x, gamma)
-
         # expander inserts singleton dimensions to gamma and beta so that they
         # can be broadcasted with x.
         head_ndim = gamma.ndim + 1

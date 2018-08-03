@@ -16,8 +16,13 @@ from chainer.cuda import memory_pool
 
 import time
 
+import pdb
+
 # for measurement computation time
 compute_events = list()
+compute_graph = {}
+var_sizes = {}
+func_backward_use_vars = {}
 
 class FunctionNode(object):
 
@@ -232,8 +237,9 @@ class FunctionNode(object):
             
             if memory_pool.get_profile_mode():
                 memory_pool.memory_log_add(("forward", str(self)))
+                streams[0].synchronize()
                 start_event = cuda.Stream.null.record()
-                
+            
             outputs = self.forward(in_data)
             
             if memory_pool.get_profile_mode():
@@ -274,8 +280,9 @@ class FunctionNode(object):
             self.outputs = tuple([weakref.ref(y.node) for y in ret])
 
             if self._input_indexes_to_retain is not None:
-                for index in self._input_indexes_to_retain:
-                    input_vars[index].retain_data()
+                for index in range(len(self.inputs)):
+                    if index in self._input_indexes_to_retain or input_vars[index].creator_node is None:
+                        input_vars[index].retain_data()
 
             if self._output_indexes_to_retain is not None:
                 retained_data = []
@@ -283,6 +290,24 @@ class FunctionNode(object):
                     ret[index].retain_data()
                     retained_data.append(outputs[index])
                 self._retained_output_data = tuple(retained_data)
+
+            if memory_pool.get_profile_mode():
+                compute_graph[str(self)] = list([str(x) for x in self.inputs])
+                for index in range(len(self.outputs)):
+                    y = self.outputs[index]()
+                    compute_graph[str(y)] = str(self)
+                    var_sizes[str(y)] = y._variable().data.nbytes
+
+                tmp_list = list()
+                if self._input_indexes_to_retain is not None:
+                    for index in range(len(self.inputs)):
+                        if index in self._input_indexes_to_retain or input_vars[index].creator_node is None:
+                            tmp_list.append(str(self.inputs[index]))
+                if self._output_indexes_to_retain is not None:
+                    for index in range(len(self.outputs)):
+                        if index in self._output_indexes_to_retain:
+                            tmp_list.append(str(self.outputs[index]()))
+                func_backward_use_vars[str(self)] = tmp_list
 
             if ooc_enabled:
                 streams[0].wait_event(cuda.Stream.null.record())

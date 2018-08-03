@@ -22,11 +22,12 @@ if cuda.cudnn_enabled:
 
 class ConvolutionND(function.Function):
 
-    def __init__(self, ndim, stride=1, pad=0, cover_all=False):
+    def __init__(self, ndim, stride=1, pad=0, cover_all=False, groups=1):
         self.ndim = ndim
         self.stride = conv_nd.as_tuple(stride, ndim)
         self.pad = conv_nd.as_tuple(pad, ndim)
         self.cover_all = cover_all
+        self.groups = groups
 
     def check_type_forward(self, in_types):
         n_in = in_types.size()
@@ -111,7 +112,7 @@ class ConvolutionND(function.Function):
 
         self.filter_desc = cudnn.create_filter_descriptor(W)
         self.conv_desc = cudnn.create_convolution_descriptor(
-            pad, stride, x.dtype)
+            pad, stride, x.dtype, groups=self.groups)
         if b is not None:
             b_index = (None, colon) + (None,) * ndim
             self.bias_desc = cudnn.create_tensor_descriptor(b[b_index])
@@ -267,7 +268,7 @@ class ConvolutionND(function.Function):
             return self._backward_cudnn(x, W, b, gy)
 
 
-def convolution_nd(x, W, b=None, stride=1, pad=0, cover_all=False):
+def convolution_nd(x, W, b=None, stride=1, pad=0, cover_all=False, groups=1):
     """N-dimensional convolution function.
 
     This is an implementation of N-dimensional convolution which is generalized
@@ -389,7 +390,7 @@ def convolution_nd(x, W, b=None, stride=1, pad=0, cover_all=False):
 
     """
     ndim = len(x.shape[2:])
-    func = ConvolutionND(ndim, stride, pad, cover_all)
+    func = ConvolutionND(ndim, stride, pad, cover_all, groups=groups)
     if b is None:
         return func(x, W)
     else:
