@@ -866,10 +866,10 @@ class Trainer(object):
             elif optimize_setting == 'recompute_all':
                 best_targets = dict(zip(target_vars, len(target_vars)*["recompute"]))
 
-            #print()
-            #print(rebuild_compute_graph(best_targets)[2])
-            #print(rebuild_compute_graph(best_targets)[3])
-            #print()
+            print()
+            print(rebuild_compute_graph(best_targets)[2])
+            print(rebuild_compute_graph(best_targets)[3])
+            print()
         
             #print("optimize_time: ", time.time() - start_time)
 

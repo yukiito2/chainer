@@ -462,6 +462,7 @@ class VariableNode(object):
         Source: https://github.com/anaruse/
                 chainer/blob/OOC_chainer_v202/chainer/variable.py
         """
+        early_stop=False
         if early_stop:
             ancestor_vnodes = self.ancestors_whose_data_on_gpu()
         else:
@@ -1304,18 +1305,21 @@ Actual: {0}'''.format(type(data))
         
         # Create events for threading
         thread_events = len(break_points)*[None]
-        for i in range(len(break_points)):
-            thread_events[i] = threading.Event()
-            thread_events[i].clear()
+        #for i in range(len(break_points)):
+        #    thread_events[i] = threading.Event()
+        #    thread_events[i].clear()
         
         # Thread to schedule swap-in task
-        def schedule_swapin(var, id):
-            if id > 0:
+        def schedule_swapin(var, id, swapin_stream):
+
+            if id > 0 and thread_events[id-1] is not None:
+                print("wait2: ", id-1)
                 thread_events[id-1].wait()
-            var.ancestors_swapin(stream=streams[0], inclusive=True, debug=ooc_debug)
-            events_swapin.append(streams[0].record())
-            streams[0].synchronize()
+            var.ancestors_swapin(stream=swapin_stream, inclusive=True, debug=ooc_debug)
+            #events_swapin.append(swapin_stream.record())
+            swapin_stream.synchronize()
             thread_events[id].set()
+            print("set: ", id)
         
         _, _, bp = heapq.heappop(break_points)
         backward_task_count = 0
@@ -1341,31 +1345,39 @@ Actual: {0}'''.format(type(data))
                 for count in range(swapin_count):
                     if len(bp_swapin_heap) > 0:
                         _, _, bp_swapin = heapq.heappop(bp_swapin_heap)
+
+                        print("check1: ", swapin_task_count)
                              
                         swapin_bytes = bp_swapin.ancestors_swapin_bytes(stream=streams[0], inclusive=True, debug=ooc_debug)
                         if swapin_bytes > 0:
-                            #print(len(bp_swapin_heap), swapin_bytes)
-                            swapin_thread = threading.Thread(target=schedule_swapin, args=(bp_swapin, swapin_task_count))
+                            print(swapin_task_count, swapin_bytes)
+                            thread_events[swapin_task_count] = threading.Event()
+                            thread_events[swapin_task_count].clear()
+                            swapin_thread = threading.Thread(target=schedule_swapin, args=(bp_swapin, swapin_task_count, streams[0]))
                             swapin_thread.start()
                             #bp_swapin.ancestors_swapin(stream=streams[0], inclusive=True, debug=ooc_debug)
                             #events_swapin.append(streams[0].record())
                             #thread_events[swapin_task_count].set()
                         else:
-                            events_swapin.append(None)
-                            thread_events[swapin_task_count].set()
+                            #events_swapin.append(None)
+                            #thread_events[swapin_task_count].set()
+                            print("set: ", swapin_task_count)
 
                         swapin_task_count += 1
 
             if ooc_async is False:
                 cuda.Stream.null.synchronize()
                   
-            thread_events[backward_task_count].wait()
+            print("wait1: ", backward_task_count)
+            if thread_events[backward_task_count] is not None:
+                thread_events[backward_task_count].wait()
             backward_task_count += 1
-            if ooc_enabled and (len(events_swapin) > 0):
-                event_swapin = events_swapin.pop(0)
-                if event_swapin is not None:
-                    # events_swapin.pop(0).synchronize()
-                    cuda.Stream.null.wait_event(event_swapin)
+            #if ooc_enabled and (len(events_swapin) > 0):
+                #event_swapin = events_swapin.pop(0)
+                #if event_swapin is not None:
+                    #events_swapin.pop(0).synchronize()
+                    #print("wait2: ", backward_task_count)
+                    #cuda.Stream.null.wait_event(event_swapin)
 
             bp.resume_backward()
             bp_var = bp.get_variable()
@@ -1373,18 +1385,22 @@ Actual: {0}'''.format(type(data))
                 bp_var._grad_var = bp._grad_var
             bp_var._backward(retain_grad, enable_double_backprop, root_node)
 
+            print("check2: ", backward_task_count-1)
+
             if ooc_enabled:
-                cuda.Stream.null.synchronize()
-                # streams[1].wait_event(cuda.Stream.null.record())
+                #cuda.Stream.null.synchronize()
+                streams[1].wait_event(cuda.Stream.null.record())
+                streams[1].synchronize()
                 bp.ancestors_free()
-               
+            print("check3: ", backward_task_count-1)   
+
             if ooc_async is False:
                 cuda.Stream.null.synchronize()
     
             bp = None
             if break_points:
                 _, _, bp = heapq.heappop(break_points)
-            
+
         if ooc_enabled:
             streams[0].synchronize()
             streams[1].synchronize()
