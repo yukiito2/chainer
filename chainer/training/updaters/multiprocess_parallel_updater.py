@@ -266,6 +266,7 @@ class MultiprocessParallelUpdater(updater.StandardUpdater):
             optimizer = self.get_optimizer('main')
             batch = self.get_iterator('main').next()
             batch = self.converter(batch, self._devices[0])
+            #batch = self.converter(batch, self._devices[0], 0)
 
             execution_time = time.time()
         
@@ -276,6 +277,9 @@ class MultiprocessParallelUpdater(updater.StandardUpdater):
             self._master.cleargrads()
             loss.backward()
 
+            # Add for RNN (tmp)
+            loss.unchain_backward()
+
             cuda.Stream.null.synchronize()
             execution_time = (time.time() - execution_time) * 1000
             execution_times.append(execution_time)
@@ -283,7 +287,7 @@ class MultiprocessParallelUpdater(updater.StandardUpdater):
                 execution_times.pop(0)
             #print("execution_time: ",  execution_time, sum(execution_times)/len(execution_times))
             #print("execution_time: ",  execution_time, f_time, execution_time-f_time)
-            print("execution_time: ", execution_time)
+            #print("execution_time: ", execution_time)
 
             
             # NCCL: reduce grads

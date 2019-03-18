@@ -18,11 +18,16 @@ from chainer.utils import argument
 from chainer import configuration
 from chainer.cuda import memory_pool
 
-# control whether to swap or not
+# control whether to swap or recompte or keep
 is_targets = list()
 # control swap-in timing
 swapin_counts = list()
+# dict of (is_targets, swapin_counts) for each problem size
+ooc_optimize_dict = {}
+keep_all_problem_size = collections.defaultdict(lambda: 0)
 ooc_optimize_setting = None
+next_num_inputs = 1
+current_computation_order = 0
 
 def _check_grad_type(func, x, gx):
     if x.data is None or gx is None:
@@ -157,6 +162,10 @@ def out_of_core_mode(async=True, fine_granularity=False, debug=False,
                                       [True, async,
                                        fine_granularity, streams,
                                        events, debug])
+
+def advise_num_inputs(n=1):
+    global next_num_inputs
+    next_num_inputs = n
 
 
 class VariableNode(object):
@@ -617,6 +626,11 @@ class VariableNode(object):
                 chainer/blob/OOC_chainer_v202/chainer/variable.py
 
         """
+        global is_targets
+        global swapin_counts
+        global keep_all_problem_size
+        global next_num_inputs
+
         variable = self._variable()
         if force is False:
             if variable is not None:
@@ -630,15 +644,50 @@ class VariableNode(object):
                     print('# variable.py:377, to_swap(), {} {}'.format(
                         self, self._creator_node))
                 
-                # check whether to swap or not
+                # check problem size
+                current_problem_size = self.data.nbytes
+                current_num_inputs = next_num_inputs
+                tmp_size = (current_num_inputs, current_problem_size)
+                if len(is_targets) == 0 and len(swapin_counts) == 0 and not(memory_pool.get_profile_mode()):
+                    #for i in keep_all_problem_size: 
+                    #    if i >= current_num_inputs and keep_all_problem_size[i] >= current_problem_size:
+                    #        print("keep_all")
+                    #        current_num_inputs = i
+                    #        current_problem_size = keep_all_problem_size[i]
+                    #        tmp_size = (current_num_inputs, current_problem_size)
+                    #        break
+
+                    # use semi-optimize result
+                    tmp_distance = float('inf')
+                    for problem_size in ooc_optimize_dict:
+                        num_inputs_ratio = current_num_inputs/problem_size[0]
+                        problem_size_ratio = current_problem_size/problem_size[1]
+                        if 0.5 < num_inputs_ratio <= 1.0 and 0.5 < problem_size_ratio <= 1.0:
+                            print(current_problem_size, problem_size, problem_size_ratio)
+                            distance = numpy.linalg.norm(numpy.array([current_num_inputs, current_problem_size])-numpy.array([problem_size[0], problem_size[1]]))
+                            if tmp_distance > distance:
+                                tmp_size = problem_size
+                                tmp_distance = distance
+
+                    if tmp_size in ooc_optimize_dict:
+                        #print("current_problem_size: ", (next_num_inputs, self.data.nbytes))
+                        #print("optimize_problem_size: ", tmp_size)
+                        tmp = ooc_optimize_dict[tmp_size]
+                        is_targets = list(tmp[0])
+                        swapin_counts = list(tmp[1])
+                    elif len(ooc_optimize_dict.keys()) > 0:
+                        #print("new_problem_size", (next_num_inputs, self.data.nbytes))
+                        memory_pool.set_profile_mode(True)
+                        
+                # check whether to swap or recompute or keep
                 if self.is_target is None:
                     if len(is_targets) == 0:
                         self.is_target = "swap"
-                    elif self.data.nbytes == is_targets[0][1]:
+                    else: 
+                        while is_targets[0][2] > current_num_inputs-1:
+                            is_targets.pop(0)
                         self.is_target = is_targets.pop(0)[0]
-                    else:
-                        self.is_target = "keep"
-
+                    
                 if self.is_target == "recompute":
                     self.data.free_data()
                     self.data = None
@@ -777,6 +826,9 @@ class VariableNode(object):
         Source: https://github.com/anaruse/
                 chainer/blob/OOC_chainer_v202/chainer/variable.py
         """
+        global current_computation_order
+        current_computation_order = 0
+
         funcs = []
         seen_funcs = set()
         break_points = []
@@ -788,7 +840,7 @@ class VariableNode(object):
                 cand.interrupt_backward()
                 cand._break_point = True
                 heapq.heappush(break_points,
-                               (~cand.rank, len(seen_break_points), cand))
+                               (-cand._creator_node_g.computation_order, len(seen_break_points), cand))
                 seen_break_points.add(cand)
 
         add_break_point(self)
@@ -812,6 +864,8 @@ class VariableNode(object):
 
                 _add_instance(funcs, seen_funcs, vnode._creator_node_g)
 
+        #for i in break_points:
+        #    print(i[0], i[1], i[2]._creator_node_g, i[2]._creator_node_g.computation_order)
         return break_points
 
 
@@ -1280,6 +1334,9 @@ Actual: {0}'''.format(type(data))
         Source: https://github.com/anaruse/
                 chainer/blob/OOC_chainer_v202/chainer/variable.py
         """
+        global is_targets
+        global swapin_counts
+
         root_node = self.node
 
         ooc_enabled, ooc_async, fine_granularity, streams, events, ooc_debug = getattr(
@@ -1291,8 +1348,8 @@ Actual: {0}'''.format(type(data))
             while events:
                 events.pop(0).synchronize()
 
-        #if memory_pool.get_profile_mode():
-        memory_pool.memory_log_add(("forward_to_backward", ))
+        if memory_pool.get_profile_mode():
+            memory_pool.memory_log_add(("forward_to_backward", ))
 
         # [OOC/LWR]
         break_points = self.node.get_break_points(fine_granularity)
@@ -1313,13 +1370,13 @@ Actual: {0}'''.format(type(data))
         def schedule_swapin(var, id, swapin_stream):
 
             if id > 0 and thread_events[id-1] is not None:
-                print("wait2: ", id-1)
+                #print("wait2: ", id-1)
                 thread_events[id-1].wait()
             var.ancestors_swapin(stream=swapin_stream, inclusive=True, debug=ooc_debug)
             #events_swapin.append(swapin_stream.record())
             swapin_stream.synchronize()
             thread_events[id].set()
-            print("set: ", id)
+            #print("set: ", id)
         
         _, _, bp = heapq.heappop(break_points)
         backward_task_count = 0
@@ -1341,16 +1398,20 @@ Actual: {0}'''.format(type(data))
                 if len(swapin_counts) == 0:
                     swapin_counts.append(1)
                 
-                swapin_count = swapin_counts.pop(0)         
+                swapin_count = swapin_counts.pop(0)     
+                # modify "swapin_count" in order to prevent dead lock (just in case)
+                if swapin_task_count+swapin_count < backward_task_count:
+                    swapin_count = backward_task_count-swapin_task_count
+
                 for count in range(swapin_count):
                     if len(bp_swapin_heap) > 0:
                         _, _, bp_swapin = heapq.heappop(bp_swapin_heap)
-
-                        print("check1: ", swapin_task_count)
+                        
+                        #print("check1: ", swapin_task_count)
                              
                         swapin_bytes = bp_swapin.ancestors_swapin_bytes(stream=streams[0], inclusive=True, debug=ooc_debug)
                         if swapin_bytes > 0:
-                            print(swapin_task_count, swapin_bytes)
+                            #print(swapin_task_count, swapin_bytes)
                             thread_events[swapin_task_count] = threading.Event()
                             thread_events[swapin_task_count].clear()
                             swapin_thread = threading.Thread(target=schedule_swapin, args=(bp_swapin, swapin_task_count, streams[0]))
@@ -1358,17 +1419,12 @@ Actual: {0}'''.format(type(data))
                             #bp_swapin.ancestors_swapin(stream=streams[0], inclusive=True, debug=ooc_debug)
                             #events_swapin.append(streams[0].record())
                             #thread_events[swapin_task_count].set()
-                        else:
-                            #events_swapin.append(None)
-                            #thread_events[swapin_task_count].set()
-                            print("set: ", swapin_task_count)
-
+                        
                         swapin_task_count += 1
 
             if ooc_async is False:
                 cuda.Stream.null.synchronize()
-                  
-            print("wait1: ", backward_task_count)
+    
             if thread_events[backward_task_count] is not None:
                 thread_events[backward_task_count].wait()
             backward_task_count += 1
@@ -1385,15 +1441,13 @@ Actual: {0}'''.format(type(data))
                 bp_var._grad_var = bp._grad_var
             bp_var._backward(retain_grad, enable_double_backprop, root_node)
 
-            print("check2: ", backward_task_count-1)
-
+            
             if ooc_enabled:
                 #cuda.Stream.null.synchronize()
                 streams[1].wait_event(cuda.Stream.null.record())
                 streams[1].synchronize()
                 bp.ancestors_free()
-            print("check3: ", backward_task_count-1)   
-
+            
             if ooc_async is False:
                 cuda.Stream.null.synchronize()
     
@@ -1405,6 +1459,8 @@ Actual: {0}'''.format(type(data))
             streams[0].synchronize()
             streams[1].synchronize()
 
+            is_targets = list()
+            swapin_counts = list()
 
     def _backward(self, retain_grad, enable_double_backprop, root_node):
         """Runs error backpropagation (a.k.a.\\  backprop) from this variable.
@@ -1490,7 +1546,7 @@ Actual: {0}'''.format(type(data))
                 return grads[node]
             return node.grad_var
 
-        # depthはあとで削除(debug用に)
+        # depthはあとで削除(debug用)
         def recompute_data(vnode, depth=0):
             if vnode.data is not None:
                 return vnode.data

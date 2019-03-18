@@ -1,17 +1,5 @@
 #!/usr/bin/env python
-"""Example code of learning a large scale convnet from ILSVRC2012 dataset
-with multiple GPUs using data parallelism.
 
-Prerequisite: To run this example, crop the center of ILSVRC2012 training and
-validation images, scale them to 256x256 and convert them to RGB, and make
-two lists of space-separated CSV whose first column is full path to image and
-second column is zero-origin label (this format is same as that used by Caffe's
-ImageDataLayer).
-
-You need to install chainer with NCCL to run this example.
-Please see https://github.com/nvidia/nccl#build--run .
-
-"""
 from __future__ import print_function
 import argparse
 import random
@@ -20,25 +8,23 @@ import numpy as np
 
 import chainer
 from chainer import training
+from chainer.dataset import convert
 from chainer.training import extensions
 from chainer.training import updaters
 
-import C3D
-import C3D_lstm
-import resnext101_3d
+import cleanup
+aaa = [448, 448, 392, 392, 338, 338, 280]
 
 class PreprocessedDataset(chainer.dataset.DatasetMixin):
 
-    def __init__(self, mean, height, width, length, random=True):
+    def __init__(self, mean, crop_size, random=True):
         #self.base = chainer.datasets.LabeledImageDataset(path, root)
         self.mean = mean.astype('f')
-        self.height = height
-        self.width = width
-        self.length = length
+        self.crop_size = crop_size
         self.random = random
 
     def __len__(self):
-        return 5000
+        return 256
 
     def get_example(self, i):
         # It reads the i-th image/label pair and return a preprocessed image.
@@ -46,41 +32,42 @@ class PreprocessedDataset(chainer.dataset.DatasetMixin):
         #     - Cropping (random or center rectangular)
         #     - Random flip
         #     - Scaling to [0, 1] value
-        height = self.height
-        width = self.width
-        length = self.length
-
-        image = np.random.rand(3, length, height, width)
-        label = np.array(1, np.int32)
         
-        image = image.astype(np.float32)
-        label *= random.randint(0, 10)
+        #crop_height_size = self.crop_size #(i//8+1)*8  #self.crop_size + (i%10)*8 
+        #crop_height_size = self.crop_size + (i%10)*8 
+        #crop_width_size = self.crop_size
 
-        return image, label
+        
+        crop_height_size = 1664 + 8*i
+        crop_width_size = 448*6 + 8*128
 
+        input_image = np.random.rand(1, crop_height_size, crop_width_size)
+        test_image = np.random.rand(1, crop_height_size, crop_width_size)
+        
+        input_image = input_image.astype(np.float32)
+        test_image = test_image.astype(np.float32)
+
+        return input_image, test_image
+
+
+def concat_examples_with_padding(batch, device=None):
+    return convert.concat_examples(batch, device, padding=0)
 
 def main():
     archs = {
-        'C3D': C3D.C3D,
-        'C3D_lstm': C3D_lstm.C3D_lstm,
-        'resnext101': resnext101_3d.ResNeXt101
+        'cleanup': cleanup.CleanupNet
     }
     optimize_settings = ['keep_all', 'swap_all_no_scheduling', 'swap_all', 'recompute_all', 'swap_opt', 'superneurons']
+
 
     parser = argparse.ArgumentParser(
         description='Learning convnet from ILSVRC2012 dataset')
     #parser.add_argument('train', help='Path to training image-label list file')
     #parser.add_argument('val', help='Path to validation image-label list file')
     parser.add_argument('--arch', '-a', choices=archs.keys(),
-                        default='nin', help='Convnet architecture')
+                        default='cleanup', help='Convnet architecture')
     parser.add_argument('--batchsize', '-B', type=int, default=32,
                         help='Learning minibatch size')
-    parser.add_argument('--height', '-H', type=int, default=224,
-                        help='input height')
-    parser.add_argument('--width', '-W', type=int, default=224,
-                        help='input width')
-    parser.add_argument('--length', '-L', type=int, default=32,
-                        help='input length')
     parser.add_argument('--epoch', '-E', type=int, default=10,
                         help='Number of epochs to train')
     parser.add_argument('--iteration', '-i', type=int, default=0,
@@ -128,10 +115,12 @@ def main():
         print('Load model from', args.initmodel)
         chainer.serializers.load_npz(args.initmodel, model)
 
+    model.converter = concat_examples_with_padding
+
     # Load the datasets and mean file
     mean = np.load(args.mean)
-    train = PreprocessedDataset(mean, args.height, args.width, args.length)
-    val = PreprocessedDataset(mean, args.height, args.width, args.length, False)
+    train = PreprocessedDataset(mean, model.insize)
+    val = PreprocessedDataset(mean, model.insize, False)
     # These iterators load the images with subprocesses running in parallel to
     # the training/validation.
 
@@ -172,23 +161,28 @@ def main():
     lr_interval = (1 if args.test else 30), 'epoch'
     snapshot_interval = (1 if args.test else 1), 'epoch'
 
-    trainer.extend(extensions.ExponentialShift("lr", 0.1), trigger=lr_interval)
-    trainer.extend(extensions.Evaluator(val_iter, model, device=args.gpus[0]),
-                   trigger=val_interval)
+    #trainer.extend(extensions.ExponentialShift("lr", 0.1), trigger=lr_interval)
+    #trainer.extend(extensions.Evaluator(val_iter, model, converter=concat_examples_with_padding, device=args.gpus[0]),
+    #               trigger=val_interval)
     #trainer.extend(extensions.dump_graph('main/loss'))
     #trainer.extend(extensions.snapshot(), trigger=snapshot_interval)
-#    trainer.extend(extensions.snapshot(), trigger=val_interval)
+    #trainer.extend(extensions.snapshot(), trigger=val_interval)
     #trainer.extend(extensions.snapshot_object(
     #    model, 'model_iter_{.updater.iteration}'), trigger=val_interval)
     # Be careful to pass the interval directly to LogReport
     # (it determines when to emit log rather than when to read observations)
-    #trainer.extend(extensions.LogReport(trigger=log_interval))
+    log_interval = (1, 'epoch')
+    trainer.extend(extensions.LogReport(trigger=log_interval))
     #trainer.extend(extensions.observe_lr(), trigger=log_interval)
     #trainer.extend(extensions.PrintReport([
     #    'epoch', 'iteration', 'main/loss', 'validation/main/loss',
     #    'main/accuracy', 'validation/main/accuracy', 'lr'
     #]), trigger=log_interval)
+    trainer.extend(extensions.PrintReport(['epoch', 'iteration', 'elapsed_time']), trigger=log_interval)
+    trainer.extend(extensions.PrintReport(['epoch', 'iteration']), trigger=(10, 'iteration'))
     #trainer.extend(extensions.ProgressBar(update_interval=2))
+
+    model.compute_accuracy = False
 
     if args.resume:
         chainer.serializers.load_npz(args.resume, trainer)

@@ -7,6 +7,7 @@ import time
 import traceback
 import itertools
 import copy
+import gc
 
 import six
 
@@ -264,7 +265,7 @@ class Trainer(object):
     def make_log_list(self):
 
         tmp_list, swap_events = memory_pool.memory_log_get()
-
+        
         exsit_swapin_items = list()
         exsit_swapout_items = collections.defaultdict(lambda: None)
         
@@ -330,12 +331,15 @@ class Trainer(object):
         
         return log_list, target_vars
         
-    def optimize_swap_targets(self):
+    def optimize_targets(self):
         
         if memory_pool.get_profile_mode():
             log_list, target_vars = self.make_log_list()
             total_mem_size = memory_pool.total_bytes()
             
+            #for i in log_list:
+            #    print(i)
+
             compute_graph = function_node.compute_graph
             var_sizes = function_node.var_sizes
             func_backward_use_vars = function_node.func_backward_use_vars
@@ -353,19 +357,13 @@ class Trainer(object):
                 backward_memory_items.pop(0)
 
             # make forward_times (for recompute)
-            forward_times = {}
+            forward_times = collections.defaultdict(lambda: 0.0)
             for item in log_list:
                 if item[0] == "forward":
                     forward_times[item[1]] = item[2]
-                
-            # make forward_times (for recompute)
-            forward_times = {}
-            for item in log_list:
-                if item[0] == "forward":
-                    forward_times[item[1]] = item[2]
-                
+                    
             # make forward_workspace_sizes (for recompute)
-            forward_workspace_sizes = {}
+            forward_workspace_sizes = collections.defaultdict(lambda: 0)
             current_layer = None
 
             for item in log_list:
@@ -830,7 +828,7 @@ class Trainer(object):
             # optimize targets and swapin_counts
             start_time = time.time()
             optimize_setting = variable.ooc_optimize_setting
-            print(optimize_setting)
+            #print(optimize_setting)
             
             initial_vars = list()
             best_targets = dict(zip(target_vars, len(target_vars)*["swap"]))
@@ -866,30 +864,60 @@ class Trainer(object):
             elif optimize_setting == 'recompute_all':
                 best_targets = dict(zip(target_vars, len(target_vars)*["recompute"]))
 
-            print()
-            print(rebuild_compute_graph(best_targets)[2])
-            print(rebuild_compute_graph(best_targets)[3])
-            print()
-        
+            #print()
+            #print(rebuild_compute_graph(best_targets)[2])
+            #print(rebuild_compute_graph(best_targets)[3])
+            #print()
+
             #print("optimize_time: ", time.time() - start_time)
 
+            # partition compute_graph per sequence (by "input layer")
+            num_inputs = 0
+            func_seq_dict = dict()
+            for node in compute_graph:
+                if "chainer.variable.VariableNode" in node:
+                    if node not in compute_graph:
+                        continue
+                    func = compute_graph[node]
+                    func_inputs = compute_graph[func]
+                    if all((var not in compute_graph) for var in func_inputs):
+                        num_inputs += 1
+                        #print("input")
+                    func_seq_dict[func] = num_inputs
+            #print("num_inputs: ", num_inputs)
+
+            
             self.is_targets = list()
             if best_targets is not None:
-                self.is_targets = [(best_targets[var], var_sizes[var]) for var in target_vars]
+                self.is_targets = [(best_targets[var], var_sizes[var], num_inputs-func_seq_dict[compute_graph[var]]) for var in target_vars]
             self.swapin_counts = best_swapin_counts
-            print("targets = ", self.is_targets)
-            print("swapin_counts = ", self.swapin_counts)
-            #print("best_time: ",best_time)
-            print()
+
+            
+            current_problem_size = self.is_targets[0][1]
+            variable.ooc_optimize_dict[(num_inputs, current_problem_size)] = (list(self.is_targets), list(self.swapin_counts))
+            #if all(x[0] == "keep" for x in self.is_targets):
+            #    variable.keep_all_problem_size[num_inputs] = max(current_problem_size, variable.keep_all_problem_size[num_inputs])
+
+            
+
+            # use same "num_inputs" for next iteration by defalut
+            variable.advise_num_inputs(num_inputs)
+
+            #print("targets = ", self.is_targets)
+            #print("swapin_counts = ", self.swapin_counts)
+            #print()
+            #for item in compute_graph:
+            #    if "chainer.variable.VariableNode" in item:
+            #        print(item, compute_graph[item], item in target_vars)
+            #        if item in var_sizes:
+            #            print(var_sizes[item])
+            #print()
 
         memory_pool.set_profile_mode(self.updater.iteration == 2)
         memory_pool.memory_log_reset()
         function_node.compute_graph = {}
         function_node.var_size = {}
         function_node.func_backward_use_vars = {}
-
-        variable.is_targets = list(self.is_targets)
-        variable.swapin_counts = list(self.swapin_counts)
 
     def run(self, show_loop_exception_msg=True):
         """Executes the training loop.
@@ -932,7 +960,7 @@ class Trainer(object):
             while not stop_trigger(self):
                 self.observation = {}
                 with reporter.scope(self.observation):
-                    self.optimize_swap_targets()
+                    self.optimize_targets()
                     update()
                     for name, entry in extensions:
                         if entry.trigger(self):
